@@ -246,7 +246,6 @@ class DisplayManager {
 
 // Active sessions for push
 const activeSessions = new Map<string, DisplayManager>();
-const sessionCleanup = new Map<string, () => void>();
 
 // ─── Push HTTP API ───
 
@@ -442,24 +441,18 @@ class G1OpenClawBridge extends AppServer {
       }
     });
 
-    // ─── Dashboard Updates ───
+    // ─── Dashboard ───
     const updateDashboard = () => {
-      const now = new Date();
-      const time = now.toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit' });
-      const status = copilotMode ? 'Copilot' : (listening ? 'Listening' : 'Ready');
-      display.setDashboard(`${time}  ${status}`);
+      const status = copilotMode ? 'Hex: Copilot' : (listening ? 'Hex: Listening...' : 'Hex: Ready');
+      display.setDashboard(status);
     };
-    const dashboardInterval = setInterval(updateDashboard, 30_000);
     updateDashboard();
-    sessionCleanup.set(sessionId, () => clearInterval(dashboardInterval));
 
     console.log(`[${sessionId}] Ready. Look up 6s to toggle mic.`);
   }
 
   protected async onStop(sessionId: string, userId: string, reason: string): Promise<void> {
     activeSessions.delete(sessionId);
-    sessionCleanup.get(sessionId)?.();
-    sessionCleanup.delete(sessionId);
     console.log(`[${sessionId}] Ended: ${reason}`);
   }
 }
