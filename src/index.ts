@@ -225,6 +225,9 @@ class DisplayManager {
     this.hideTimer = setTimeout(() => this.session.layouts.clearView(), durationMs);
   }
 
+  // Note: Bitmap animations don't work well on G1 — bandwidth too low for frame-by-frame over cloud.
+  // SDK's showBitmapAnimation only works on iOS. Use static bitmaps instead.
+
   showStatus(text: string, durationMs = 3000) {
     this.cancelHide();
     this.session.layouts.showTextWall(text);
