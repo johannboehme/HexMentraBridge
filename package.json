@@ -1,0 +1,21 @@
+{
+  "name": "g1-openclaw-bridge",
+  "version": "0.1.0",
+  "description": "Bridge between Even Realities G1 smart glasses (via MentraOS) and OpenClaw",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "bun src/index.ts",
+    "dev": "bun --hot src/index.ts"
+  },
+  "dependencies": {
+    "@mentra/sdk": "latest",
+    "express": "^4.21.2",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.13.14",
+    "@types/ws": "^8.18.0"
+  }
+}
