@@ -334,7 +334,15 @@ class G1OpenClawBridge extends AppServer {
         return;
       }
 
-      if (lower.includes('copilot modus') || lower.includes('copilot mode')) {
+      // Copilot toggle — must match strict patterns only
+      const normalized = lower.replace(/[-]/g, '').replace(/[.,!?]/g, '').trim();
+      const copilotPatterns = [
+        'copilot modus', 'copilot mode',
+        'copilot an', 'copilot aus',
+        'copilot on', 'copilot off',
+        'copilotmodus',
+      ];
+      if (copilotPatterns.some(p => normalized === p)) {
         copilotMode = !copilotMode;
         const state = copilotMode ? 'Copilot ON' : 'Copilot OFF';
         console.log(`[${sessionId}] ${state}`);
@@ -346,11 +354,13 @@ class G1OpenClawBridge extends AppServer {
       // Copilot mode: silent transcription, contextual hints
       if (copilotMode) {
         console.log(`[${sessionId}] Copilot heard: "${userText}"`);
-        // Don't show transcript on display — silent
         const reply = await openclawClient.chat(userText, G1_COPILOT_PREFIX);
-        if (reply && reply.length > 0) {
+        // Filter out NO_REPLY / empty / non-useful responses
+        if (reply && reply.length > 0 && !reply.trim().startsWith('NO_REPLY') && !reply.trim().startsWith('NO_RE')) {
           console.log(`[${sessionId}] Copilot hint: "${reply.substring(0, 80)}"`);
           display.showReply(reply);
+        } else {
+          console.log(`[${sessionId}] Copilot: nothing to show`);
         }
         return;
       }
@@ -364,8 +374,13 @@ class G1OpenClawBridge extends AppServer {
         () => display.showWaiting()
       );
 
-      console.log(`[${sessionId}] Hex: "${reply.substring(0, 80)}"`);
-      display.showReply(reply);
+      // Filter NO_REPLY responses
+      if (reply && !reply.trim().startsWith('NO_REPLY') && !reply.trim().startsWith('NO_RE')) {
+        console.log(`[${sessionId}] Hex: "${reply.substring(0, 80)}"`);
+        display.showReply(reply);
+      } else {
+        console.log(`[${sessionId}] Hex: silent (NO_REPLY)`);
+      }
     };
 
     // ─── Start/Stop Listening ───
