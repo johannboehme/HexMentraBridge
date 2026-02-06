@@ -117,6 +117,15 @@ class OpenClawClient {
     });
   }
 
+  /** Send a raw message (e.g. /new, /status) without waiting for reply */
+  async sendRaw(message: string): Promise<void> {
+    await this.request('chat.send', {
+      message,
+      sessionKey: 'agent:main:main',
+      idempotencyKey: `g1-${Date.now()}`,
+    });
+  }
+
   isConnected() { return this.connected; }
 }
 
@@ -317,6 +326,20 @@ class G1OpenClawBridge extends AppServer {
         if (!data.isFinal) return;
         const userText = data.text.trim();
         if (!userText) return;
+
+        // "Neue Session" / "New Session" → reset main session
+        const lower = userText.toLowerCase();
+        if (lower.includes('neue session') || lower.includes('new session')) {
+          console.log(`[${sessionId}] Session reset requested`);
+          display.showStatus('New session...', 3000);
+          try {
+            await openclawClient.sendRaw('/new');
+          } catch (e: any) {
+            console.error(`[${sessionId}] Reset failed:`, e.message);
+          }
+          display.showStatus('Session reset.', 3000);
+          return;
+        }
 
         console.log(`[${sessionId}] User: "${userText}"`);
         display.showThinking(userText);
