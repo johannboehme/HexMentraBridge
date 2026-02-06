@@ -235,6 +235,10 @@ class DisplayManager {
     try { this.session.dashboard.content.write(text, ['main']); } catch (e) {}
   }
 
+  showDashboardCard(left: string, right: string) {
+    try { this.session.layouts.showDashboardCard(left, right); } catch (e) {}
+  }
+
   private cancelHide() {
     if (this.hideTimer) { clearTimeout(this.hideTimer); this.hideTimer = null; }
   }
@@ -242,6 +246,7 @@ class DisplayManager {
 
 // Active sessions for push
 const activeSessions = new Map<string, DisplayManager>();
+const sessionCleanup = new Map<string, () => void>();
 
 // ─── Push HTTP API ───
 
@@ -347,7 +352,7 @@ class G1OpenClawBridge extends AppServer {
         const state = copilotMode ? 'Copilot ON' : 'Copilot OFF';
         console.log(`[${sessionId}] ${state}`);
         display.showStatus(state, 3000);
-        display.setDashboard(`Hex: ${copilotMode ? 'Copilot' : 'Listening...'}`);
+        updateDashboard();
         return;
       }
 
@@ -389,7 +394,7 @@ class G1OpenClawBridge extends AppServer {
       listening = true;
       console.log(`[${sessionId}] Mic ON`);
       display.showStatus('Listening...', 2000);
-      display.setDashboard(`Hex: ${copilotMode ? 'Copilot' : 'Listening...'}`);
+      updateDashboard();
       unsubTranscription = session.events.onTranscription(handleTranscription);
     };
 
@@ -399,7 +404,7 @@ class G1OpenClawBridge extends AppServer {
       console.log(`[${sessionId}] Mic OFF`);
       if (unsubTranscription) { unsubTranscription(); unsubTranscription = null; }
       display.showStatus('Mic off.', 2000);
-      display.setDashboard('Hex: Ready');
+      updateDashboard();
     };
 
     // ─── Phone Notifications ───
@@ -437,11 +442,24 @@ class G1OpenClawBridge extends AppServer {
       }
     });
 
+    // ─── Dashboard Updates ───
+    const updateDashboard = () => {
+      const now = new Date();
+      const time = now.toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit' });
+      const status = copilotMode ? 'Copilot' : (listening ? 'Listening' : 'Ready');
+      display.setDashboard(`${time}  ${status}`);
+    };
+    const dashboardInterval = setInterval(updateDashboard, 30_000);
+    updateDashboard();
+    sessionCleanup.set(sessionId, () => clearInterval(dashboardInterval));
+
     console.log(`[${sessionId}] Ready. Look up 6s to toggle mic.`);
   }
 
   protected async onStop(sessionId: string, userId: string, reason: string): Promise<void> {
     activeSessions.delete(sessionId);
+    sessionCleanup.get(sessionId)?.();
+    sessionCleanup.delete(sessionId);
     console.log(`[${sessionId}] Ended: ${reason}`);
   }
 }
