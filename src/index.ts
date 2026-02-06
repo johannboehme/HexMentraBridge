@@ -197,19 +197,63 @@ class DisplayManager {
 
   showThinking(userText: string) {
     this.cancelHide();
+    this.cancelScroll();
     this.session.layouts.showReferenceCard(userText, 'Thinking...');
   }
 
   showWaiting() {
     this.cancelHide();
+    this.cancelScroll();
     this.session.layouts.showTextWall('Moment...');
+  }
+
+  private scrollTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private cancelScroll() {
+    if (this.scrollTimer) { clearTimeout(this.scrollTimer); this.scrollTimer = null; }
   }
 
   showReply(answer: string) {
     this.cancelHide();
-    const truncated = answer.length > 280 ? answer.substring(0, 277) + '...' : answer;
-    this.session.layouts.showTextWall(truncated);
-    this.hideTimer = setTimeout(() => this.session.layouts.clearView(), 15000);
+    this.cancelScroll();
+
+    const CHUNK_SIZE = 250;
+    if (answer.length <= CHUNK_SIZE) {
+      this.session.layouts.showTextWall(answer);
+      this.hideTimer = setTimeout(() => this.session.layouts.clearView(), 15000);
+      return;
+    }
+
+    // Split into chunks at word boundaries
+    const chunks: string[] = [];
+    let remaining = answer;
+    while (remaining.length > 0) {
+      if (remaining.length <= CHUNK_SIZE) {
+        chunks.push(remaining);
+        break;
+      }
+      let cut = remaining.lastIndexOf(' ', CHUNK_SIZE);
+      if (cut < 100) cut = CHUNK_SIZE;
+      chunks.push(remaining.substring(0, cut));
+      remaining = remaining.substring(cut).trimStart();
+    }
+
+    const total = chunks.length;
+    let current = 0;
+    const SECONDS_PER_CHUNK = 8;
+
+    const showNext = () => {
+      if (current >= total) {
+        this.hideTimer = setTimeout(() => this.session.layouts.clearView(), 3000);
+        return;
+      }
+      const label = total > 1 ? `[${current + 1}/${total}] ` : '';
+      this.session.layouts.showTextWall(label + chunks[current]);
+      current++;
+      this.scrollTimer = setTimeout(showNext, SECONDS_PER_CHUNK * 1000);
+    };
+
+    showNext();
   }
 
   showNotification(text: string, durationMs = 10000) {
