@@ -16,6 +16,31 @@ const NOTIF_BLOCKLIST = (process.env.NOTIF_BLOCKLIST || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 const G1_PREFIX = '⚠️ G1 BRIDGE DISPLAY: Use only 2-3 short sentences, no markdown, no emojis!\n\n';
+
+// Generate a minimal black 526x100 24-bit BMP as base64 for clearing green line artifacts
+function generateBlackBitmap(): string {
+  const w = 526, h = 100;
+  const rowBytes = w * 3;
+  const padding = (4 - (rowBytes % 4)) % 4;
+  const stride = rowBytes + padding;
+  const pixelDataSize = stride * h;
+  const fileSize = 54 + pixelDataSize;
+  const buf = Buffer.alloc(fileSize);
+  // BMP header
+  buf.write('BM', 0);
+  buf.writeUInt32LE(fileSize, 2);
+  buf.writeUInt32LE(54, 10); // pixel data offset
+  // DIB header
+  buf.writeUInt32LE(40, 14); // header size
+  buf.writeInt32LE(w, 18);
+  buf.writeInt32LE(h, 22);
+  buf.writeUInt16LE(1, 26);  // planes
+  buf.writeUInt16LE(24, 28); // bits per pixel
+  buf.writeUInt32LE(pixelDataSize, 34);
+  // All pixel data stays 0 (black) — Buffer.alloc zero-fills
+  return buf.toString('base64');
+}
+const BLACK_BITMAP_B64 = generateBlackBitmap();
 const G1_COPILOT_PREFIX = '⚠️ G1 COPILOT MODE: The user is having a conversation nearby. You are listening silently. Do NOT respond directly. Instead, provide 1-2 short contextual hints, facts, or suggestions that might help the user. No markdown, no emojis. Ultra short.\n\nOverheard: ';
 const SOFT_TIMEOUT_MS = 45_000;
 const HARD_TIMEOUT_MS = 300_000;
@@ -245,10 +270,14 @@ class DisplayManager {
     await this.session.layouts.showBitmapView(base64Bmp);
     this.busy = true;
     this.busyUntil = Date.now() + durationMs;
-    this.hideTimer = setTimeout(() => {
-      this.session.layouts.clearView();
-      this.busy = false;
-      this.processQueue();
+    this.hideTimer = setTimeout(async () => {
+      // Push a black bitmap to clear green line artifact before clearView
+      try { await this.session.layouts.showBitmapView(BLACK_BITMAP_B64); } catch (e) {}
+      setTimeout(() => {
+        this.session.layouts.clearView();
+        this.busy = false;
+        this.processQueue();
+      }, 200);
     }, durationMs);
   }
 
