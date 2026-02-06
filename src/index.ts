@@ -278,7 +278,7 @@ class DisplayManager {
   private _showText(text: string, singlePageMs: number, perPageMs: number) {
     this.cancelAll();
 
-    const CHUNK_SIZE = 250;
+    const CHUNK_SIZE = 180;
     if (text.length <= CHUNK_SIZE) {
       this.session.layouts.showTextWall(text);
       this.busy = true;
