@@ -9,6 +9,10 @@ const PUSH_PORT = parseInt(process.env.PUSH_PORT || '3001');
 const OPENCLAW_WS_URL = process.env.OPENCLAW_WS_URL || 'ws://localhost:18789';
 const OPENCLAW_GW_TOKEN = process.env.OPENCLAW_GW_TOKEN || '';
 
+// Notification blocklist: comma-separated app names (case-insensitive)
+const NOTIF_BLOCKLIST = (process.env.NOTIF_BLOCKLIST || '')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
 const G1_PREFIX = '⚠️ G1 BRIDGE DISPLAY: Use only 2-3 short sentences, no markdown, no emojis!\n\n';
 const G1_COPILOT_PREFIX = '⚠️ G1 COPILOT MODE: The user is having a conversation nearby. You are listening silently. Do NOT respond directly. Instead, provide 1-2 short contextual hints, facts, or suggestions that might help the user. No markdown, no emojis. Ultra short.\n\nOverheard: ';
 const SOFT_TIMEOUT_MS = 45_000;
@@ -16,7 +20,7 @@ const HARD_TIMEOUT_MS = 300_000;
 const RECONNECT_DELAY_MS = 5_000;
 const MAX_RECONNECT_DELAY_MS = 60_000;
 const HEAD_HOLD_MS = 6_000;
-const MAX_NOTIF_BODY = 150;
+const NOTIF_DEDUP_WINDOW_MS = 10_000;
 
 // ─── OpenClaw Gateway WebSocket Client (with auto-reconnect) ───
 
@@ -52,7 +56,7 @@ class OpenClawClient {
           type: 'req', id: connId, method: 'connect',
           params: {
             minProtocol: 3, maxProtocol: 3,
-            client: { id: 'gateway-client', displayName: 'G1 Bridge', version: '0.6.0', platform: 'linux', mode: 'cli' },
+            client: { id: 'gateway-client', displayName: 'G1 Bridge', version: '0.7.0', platform: 'linux', mode: 'cli' },
             auth: { token: OPENCLAW_GW_TOKEN },
           },
         });
@@ -113,7 +117,6 @@ class OpenClawClient {
       this.ws.on('close', () => {
         console.log('[OpenClaw] WS closed');
         this.connected = false;
-        // Reject all pending requests
         for (const [id, p] of this.pending) {
           p.reject(new Error('WS closed'));
         }
@@ -181,52 +184,114 @@ class OpenClawClient {
 
 const openclawClient = new OpenClawClient();
 
-// ─── Display Manager ───
+// ─── Display Manager (with queue) ───
+
+type DisplayJob = { type: 'text'; text: string; durationMs: number; perPageMs: number }
+  | { type: 'status'; text: string; durationMs: number }
+  | { type: 'thinking'; userText: string }
+  | { type: 'bitmap'; data: string; durationMs: number };
 
 class DisplayManager {
   private session: AppSession;
   private hideTimer: ReturnType<typeof setTimeout> | null = null;
+  private scrollTimer: ReturnType<typeof setTimeout> | null = null;
+  private busy = false;
+  private busyUntil = 0;
+  private queue: DisplayJob[] = [];
 
   constructor(session: AppSession) { this.session = session; }
 
+  // ─── Public API ───
+
   showWelcome(text: string) {
-    this.cancelHide();
+    this.cancelAll();
     this.session.layouts.showTextWall(text);
     this.hideTimer = setTimeout(() => this.session.layouts.clearView(), 3000);
   }
 
   showThinking(userText: string) {
-    this.cancelHide();
-    this.cancelScroll();
+    this.cancelAll();
+    this.queue = []; // Clear pending notifications — user interaction takes priority
     this.session.layouts.showReferenceCard(userText, 'Thinking...');
+    this.busy = true;
+    this.busyUntil = Date.now() + HARD_TIMEOUT_MS;
   }
 
   showWaiting() {
-    this.cancelHide();
-    this.cancelScroll();
+    this.cancelAll();
     this.session.layouts.showTextWall('Moment...');
-  }
-
-  private scrollTimer: ReturnType<typeof setTimeout> | null = null;
-
-  private cancelScroll() {
-    if (this.scrollTimer) { clearTimeout(this.scrollTimer); this.scrollTimer = null; }
+    this.busy = true;
+    this.busyUntil = Date.now() + HARD_TIMEOUT_MS;
   }
 
   showReply(answer: string) {
-    this.cancelHide();
-    this.cancelScroll();
+    this.queue = []; // Clear pending notifications — reply takes priority
+    this._showText(answer, 15000, 8000);
+  }
+
+  showNotification(text: string, durationMs = 10000) {
+    if (this.busy && Date.now() < this.busyUntil) {
+      // Queue it — will show after current display finishes
+      this.queue.push({ type: 'text', text, durationMs, perPageMs: 8000 });
+      return;
+    }
+    this._showText(text, durationMs, 8000);
+  }
+
+  async showBitmap(base64Bmp: string, durationMs = 10000) {
+    this.cancelAll();
+    await this.session.layouts.showBitmapView(base64Bmp);
+    this.busy = true;
+    this.busyUntil = Date.now() + durationMs;
+    this.hideTimer = setTimeout(() => {
+      this.session.layouts.clearView();
+      this.busy = false;
+      this.processQueue();
+    }, durationMs);
+  }
+
+  showStatus(text: string, durationMs = 3000) {
+    // Status messages are brief and don't queue
+    this.cancelAll();
+    this.session.layouts.showTextWall(text);
+    this.busy = true;
+    this.busyUntil = Date.now() + durationMs;
+    this.hideTimer = setTimeout(() => {
+      this.session.layouts.clearView();
+      this.busy = false;
+      this.processQueue();
+    }, durationMs);
+  }
+
+  setDashboard(text: string) {
+    try { this.session.dashboard.content.write(text, ['main']); } catch (e) {}
+  }
+
+  showDashboardCard(left: string, right: string) {
+    try { this.session.layouts.showDashboardCard(left, right); } catch (e) {}
+  }
+
+  // ─── Internal ───
+
+  private _showText(text: string, singlePageMs: number, perPageMs: number) {
+    this.cancelAll();
 
     const CHUNK_SIZE = 250;
-    if (answer.length <= CHUNK_SIZE) {
-      this.session.layouts.showTextWall(answer);
-      this.hideTimer = setTimeout(() => this.session.layouts.clearView(), 15000);
+    if (text.length <= CHUNK_SIZE) {
+      this.session.layouts.showTextWall(text);
+      this.busy = true;
+      this.busyUntil = Date.now() + singlePageMs;
+      this.hideTimer = setTimeout(() => {
+        this.session.layouts.clearView();
+        this.busy = false;
+        this.processQueue();
+      }, singlePageMs);
       return;
     }
 
     // Split into chunks at word boundaries
     const chunks: string[] = [];
-    let remaining = answer;
+    let remaining = text;
     while (remaining.length > 0) {
       if (remaining.length <= CHUNK_SIZE) {
         chunks.push(remaining);
@@ -240,54 +305,74 @@ class DisplayManager {
 
     const total = chunks.length;
     let current = 0;
-    const SECONDS_PER_CHUNK = 8;
+    this.busy = true;
+    this.busyUntil = Date.now() + (total * perPageMs) + 3000;
 
     const showNext = () => {
       if (current >= total) {
-        this.hideTimer = setTimeout(() => this.session.layouts.clearView(), 3000);
+        this.hideTimer = setTimeout(() => {
+          this.session.layouts.clearView();
+          this.busy = false;
+          this.processQueue();
+        }, 3000);
         return;
       }
-      const label = total > 1 ? `[${current + 1}/${total}] ` : '';
+      const label = `[${current + 1}/${total}] `;
       this.session.layouts.showTextWall(label + chunks[current]);
       current++;
-      this.scrollTimer = setTimeout(showNext, SECONDS_PER_CHUNK * 1000);
+      this.scrollTimer = setTimeout(showNext, perPageMs);
     };
 
     showNext();
   }
 
-  showNotification(text: string, durationMs = 10000) {
-    this.cancelHide();
-    const truncated = text.length > 280 ? text.substring(0, 277) + '...' : text;
-    this.session.layouts.showReferenceCard('Hex', truncated);
-    this.hideTimer = setTimeout(() => this.session.layouts.clearView(), durationMs);
+  private processQueue() {
+    if (this.queue.length === 0) return;
+    const next = this.queue.shift()!;
+    switch (next.type) {
+      case 'text':
+        this._showText(next.text, next.durationMs, next.perPageMs);
+        break;
+      case 'status':
+        this.showStatus(next.text, next.durationMs);
+        break;
+      case 'bitmap':
+        this.showBitmap(next.data, next.durationMs);
+        break;
+    }
   }
 
-  async showBitmap(base64Bmp: string, durationMs = 10000) {
-    this.cancelHide();
-    await this.session.layouts.showBitmapView(base64Bmp);
-    this.hideTimer = setTimeout(() => this.session.layouts.clearView(), durationMs);
-  }
-
-  // Note: Bitmap animations don't work well on G1 — bandwidth too low for frame-by-frame over cloud.
-  // SDK's showBitmapAnimation only works on iOS. Use static bitmaps instead.
-
-  showStatus(text: string, durationMs = 3000) {
-    this.cancelHide();
-    this.session.layouts.showTextWall(text);
-    this.hideTimer = setTimeout(() => this.session.layouts.clearView(), durationMs);
-  }
-
-  setDashboard(text: string) {
-    try { this.session.dashboard.content.write(text, ['main']); } catch (e) {}
-  }
-
-  showDashboardCard(left: string, right: string) {
-    try { this.session.layouts.showDashboardCard(left, right); } catch (e) {}
-  }
-
-  private cancelHide() {
+  private cancelAll() {
     if (this.hideTimer) { clearTimeout(this.hideTimer); this.hideTimer = null; }
+    if (this.scrollTimer) { clearTimeout(this.scrollTimer); this.scrollTimer = null; }
+    this.busy = false;
+  }
+}
+
+// ─── Notification Deduplicator ───
+
+class NotificationDedup {
+  private pending = new Map<string, { count: number; lastBody: string; timer: ReturnType<typeof setTimeout> }>();
+
+  constructor(private onFlush: (app: string, count: number, lastBody: string) => void) {}
+
+  add(app: string, body: string) {
+    const key = app.toLowerCase();
+    const existing = this.pending.get(key);
+
+    if (existing) {
+      existing.count++;
+      existing.lastBody = body;
+      return; // Timer is already running, will flush soon
+    }
+
+    // First notification from this app — start dedup window
+    const entry = { count: 1, lastBody: body, timer: setTimeout(() => {
+      this.pending.delete(key);
+      this.onFlush(app, entry.count, entry.lastBody);
+    }, NOTIF_DEDUP_WINDOW_MS) };
+
+    this.pending.set(key, entry);
   }
 }
 
@@ -406,7 +491,6 @@ class G1OpenClawBridge extends AppServer {
       if (copilotMode) {
         console.log(`[${sessionId}] Copilot heard: "${userText}"`);
         const reply = await openclawClient.chat(userText, G1_COPILOT_PREFIX);
-        // Filter out NO_REPLY / empty / non-useful responses
         if (reply && reply.length > 0 && !reply.trim().startsWith('NO_REPLY') && !reply.trim().startsWith('NO_RE')) {
           console.log(`[${sessionId}] Copilot hint: "${reply.substring(0, 80)}"`);
           display.showReply(reply);
@@ -425,7 +509,6 @@ class G1OpenClawBridge extends AppServer {
         () => display.showWaiting()
       );
 
-      // Filter NO_REPLY responses
       if (reply && !reply.trim().startsWith('NO_REPLY') && !reply.trim().startsWith('NO_RE')) {
         console.log(`[${sessionId}] Hex: "${reply.substring(0, 80)}"`);
         display.showReply(reply);
@@ -453,18 +536,34 @@ class G1OpenClawBridge extends AppServer {
       updateDashboard();
     };
 
-    // ─── Phone Notifications ───
+    // ─── Phone Notifications (with dedup + blocklist + queue) ───
+    const notifDedup = new NotificationDedup((app, count, lastBody) => {
+      if (count === 1) {
+        display.showNotification(`${app}\n${lastBody}`, 10000);
+      } else {
+        display.showNotification(`${app} (${count} new)\n${lastBody}`, 10000);
+      }
+    });
+
     session.events.onPhoneNotifications((data: any) => {
       const app = data.app || 'Notification';
+
+      // Blocklist check
+      if (NOTIF_BLOCKLIST.includes(app.toLowerCase())) {
+        console.log(`[${sessionId}] NOTIF BLOCKED: ${app}`);
+        return;
+      }
+
       const title = data.title || '';
       const content = data.content || '';
       let body = title && content ? `${title}: ${content}` : (title || content);
-      if (body.length > MAX_NOTIF_BODY) {
-        const cut = body.lastIndexOf(' ', MAX_NOTIF_BODY);
-        body = body.substring(0, cut > 80 ? cut : MAX_NOTIF_BODY) + '...';
+      if (body.length > 200) {
+        const cut = body.lastIndexOf(' ', 200);
+        body = body.substring(0, cut > 80 ? cut : 200) + '...';
       }
+
       console.log(`[${sessionId}] NOTIF: ${app} — ${body}`);
-      display.showNotification(`${app}\n${body}`, 10000);
+      notifDedup.add(app, body);
     });
 
     // ─── Head-Up Toggle (6s hold) ───
@@ -496,6 +595,9 @@ class G1OpenClawBridge extends AppServer {
     updateDashboard();
 
     console.log(`[${sessionId}] Ready. Look up 6s to toggle mic.`);
+    if (NOTIF_BLOCKLIST.length > 0) {
+      console.log(`[${sessionId}] Notification blocklist: ${NOTIF_BLOCKLIST.join(', ')}`);
+    }
   }
 
   protected async onStop(sessionId: string, userId: string, reason: string): Promise<void> {
@@ -507,10 +609,13 @@ class G1OpenClawBridge extends AppServer {
 // ─── Main ───
 
 async function main() {
-  console.log('G1-OpenClaw Bridge v0.6.0');
+  console.log('G1-OpenClaw Bridge v0.7.0');
   console.log(`  MentraOS: ${PACKAGE_NAME}`);
   console.log(`  OpenClaw: ${OPENCLAW_WS_URL}`);
   console.log(`  Ports: ${PORT} (MentraOS), ${PUSH_PORT} (Push API)`);
+  if (NOTIF_BLOCKLIST.length > 0) {
+    console.log(`  Notification blocklist: ${NOTIF_BLOCKLIST.join(', ')}`);
+  }
 
   try { await openclawClient.connect(); }
   catch (err: any) { console.error('OpenClaw connect failed:', err.message); }
