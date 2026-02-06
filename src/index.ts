@@ -6,6 +6,8 @@ const PACKAGE_NAME = process.env.PACKAGE_NAME ?? (() => { throw new Error('PACKA
 const MENTRAOS_API_KEY = process.env.MENTRAOS_API_KEY ?? (() => { throw new Error('MENTRAOS_API_KEY not set'); })();
 const PORT = parseInt(process.env.PORT || '3000');
 const PUSH_PORT = parseInt(process.env.PUSH_PORT || '3001');
+const PUSH_BIND = process.env.PUSH_BIND || '127.0.0.1';
+const PUSH_TOKEN = process.env.PUSH_TOKEN || '';  // Optional auth token for external access
 const OPENCLAW_WS_URL = process.env.OPENCLAW_WS_URL || 'ws://localhost:18789';
 const OPENCLAW_GW_TOKEN = process.env.OPENCLAW_GW_TOKEN || '';
 
@@ -19,7 +21,7 @@ const SOFT_TIMEOUT_MS = 45_000;
 const HARD_TIMEOUT_MS = 300_000;
 const RECONNECT_DELAY_MS = 5_000;
 const MAX_RECONNECT_DELAY_MS = 60_000;
-const HEAD_HOLD_MS = 6_000;
+const HEAD_HOLD_MS = 5_000;
 const NOTIF_DEDUP_WINDOW_MS = 10_000;
 
 // ─── OpenClaw Gateway WebSocket Client (with auto-reconnect) ───
@@ -56,7 +58,7 @@ class OpenClawClient {
           type: 'req', id: connId, method: 'connect',
           params: {
             minProtocol: 3, maxProtocol: 3,
-            client: { id: 'gateway-client', displayName: 'G1 Bridge', version: '0.7.0', platform: 'linux', mode: 'cli' },
+            client: { id: 'gateway-client', displayName: 'G1 Bridge', version: '0.8.0', platform: 'linux', mode: 'cli' },
             auth: { token: OPENCLAW_GW_TOKEN },
           },
         });
@@ -388,14 +390,32 @@ class NotificationDedup {
   }
 }
 
-// Active sessions for push
-const activeSessions = new Map<string, DisplayManager>();
+// Active sessions for push + mic control
+type SessionHandle = {
+  display: DisplayManager;
+  toggleMic: () => void;
+  getMicState: () => boolean;
+};
+const activeSessions = new Map<string, SessionHandle>();
 
 // ─── Push HTTP API ───
 
 function startPushServer() {
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    if (req.method === 'POST' && req.url === '/push') {
+    // Auth check for external access (skip for localhost when no token set)
+    if (PUSH_TOKEN) {
+      const auth = req.headers['authorization'] || '';
+      let urlToken: string | null = null;
+      try { urlToken = new URL(req.url || '/', `http://localhost`).searchParams.get('token'); } catch (e) {}
+      if (auth !== `Bearer ${PUSH_TOKEN}` && urlToken !== PUSH_TOKEN) {
+        res.writeHead(401); res.end('{"error":"unauthorized"}');
+        return;
+      }
+    }
+
+    const path = (req.url || '/').split('?')[0];
+
+    if (req.method === 'POST' && path === '/push') {
       let body = '';
       req.on('data', (c) => { body += c; });
       req.on('end', () => {
@@ -403,7 +423,7 @@ function startPushServer() {
           const { text, duration = 10000 } = JSON.parse(body);
           if (!text) { res.writeHead(400); res.end('{"error":"text required"}'); return; }
           let sent = 0;
-          for (const [id, d] of activeSessions) { d.showNotification(text, duration); sent++; }
+          for (const [id, h] of activeSessions) { h.display.showNotification(text, duration); sent++; }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, sessions: sent }));
         } catch (e) { res.writeHead(400); res.end('{"error":"invalid json"}'); }
@@ -411,7 +431,7 @@ function startPushServer() {
       return;
     }
 
-    if (req.method === 'POST' && req.url === '/push-bitmap') {
+    if (req.method === 'POST' && path === '/push-bitmap') {
       let body = '';
       req.on('data', (c) => { body += c; });
       req.on('end', async () => {
@@ -419,8 +439,8 @@ function startPushServer() {
           const { bitmap, duration = 10000 } = JSON.parse(body);
           if (!bitmap) { res.writeHead(400); res.end('{"error":"bitmap required"}'); return; }
           let sent = 0;
-          for (const [id, d] of activeSessions) {
-            try { await d.showBitmap(bitmap, duration); sent++; } catch (e) {}
+          for (const [id, h] of activeSessions) {
+            try { await h.display.showBitmap(bitmap, duration); sent++; } catch (e) {}
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, sessions: sent }));
@@ -429,20 +449,46 @@ function startPushServer() {
       return;
     }
 
-    if (req.method === 'GET' && req.url === '/status') {
+    if (req.method === 'POST' && path === '/mic') {
+      // Toggle mic on all active sessions — for WearOS/Tasker trigger
+      let toggled = 0;
+      let micState = false;
+      for (const [id, h] of activeSessions) {
+        h.toggleMic();
+        micState = h.getMicState();
+        toggled++;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, sessions: toggled, listening: micState }));
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/mic') {
+      // Get mic state
+      let micState = false;
+      for (const [id, h] of activeSessions) { micState = h.getMicState(); }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, sessions: activeSessions.size, listening: micState }));
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/status') {
+      let micState = false;
+      for (const [id, h] of activeSessions) { micState = h.getMicState(); }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
         openclaw: openclawClient.isConnected(),
         sessions: activeSessions.size,
         sessionIds: [...activeSessions.keys()],
+        listening: micState,
       }));
       return;
     }
 
     res.writeHead(404); res.end('Not found');
   });
-  server.listen(PUSH_PORT, '127.0.0.1', () => console.log(`[Push] API on http://127.0.0.1:${PUSH_PORT}`));
+  server.listen(PUSH_PORT, PUSH_BIND, () => console.log(`[Push] API on http://${PUSH_BIND}:${PUSH_PORT}${PUSH_TOKEN ? ' (auth required)' : ''}`));
 }
 
 // ─── Bridge App ───
@@ -456,7 +502,6 @@ class G1OpenClawBridge extends AppServer {
     console.log(`[${sessionId}] Connected: ${userId}`);
 
     const display = new DisplayManager(session);
-    activeSessions.set(sessionId, display);
     display.showWelcome(openclawClient.isConnected() ? 'Hex connected.' : 'Hex offline.');
     display.setDashboard('Hex: Ready');
 
@@ -464,6 +509,10 @@ class G1OpenClawBridge extends AppServer {
     let listening = false;
     let copilotMode = false;
     let unsubTranscription: (() => void) | null = null;
+    let resubAttempts = 0;
+    let resubTimer: ReturnType<typeof setTimeout> | null = null;
+    const RESUB_BASE_DELAY_MS = 3_000;     // Start with 3s
+    const MAX_RESUB_DELAY_MS = 120_000;    // Max 2min between retries
 
     // ─── Transcription Handler ───
     const handleTranscription = async (data: any) => {
@@ -529,6 +578,56 @@ class G1OpenClawBridge extends AppServer {
       }
     };
 
+    // ─── Transcription Subscribe with auto-resubscribe on error ───
+    const subscribeTranscription = () => {
+      if (unsubTranscription) {
+        try { unsubTranscription(); } catch (e) {}
+        unsubTranscription = null;
+      }
+
+      try {
+        unsubTranscription = session.events.onTranscription(handleTranscription, {
+          onError: (err: any) => {
+            console.error(`[${sessionId}] Transcription stream error:`, err?.message || err);
+            scheduleResub();
+          },
+          onEnd: () => {
+            console.log(`[${sessionId}] Transcription stream ended unexpectedly`);
+            scheduleResub();
+          },
+        } as any);
+      } catch (e: any) {
+        // If onTranscription doesn't support error callbacks, use basic subscribe
+        console.log(`[${sessionId}] Transcription subscribe (basic mode)`);
+        unsubTranscription = session.events.onTranscription(handleTranscription);
+      }
+
+      resubAttempts = 0;
+      console.log(`[${sessionId}] Transcription subscribed`);
+    };
+
+    const scheduleResub = () => {
+      if (!listening) return;
+      if (resubTimer) return; // Already scheduled
+
+      resubAttempts++;
+      const delay = Math.min(RESUB_BASE_DELAY_MS * Math.pow(2, resubAttempts - 1), MAX_RESUB_DELAY_MS);
+      console.log(`[${sessionId}] Resubscribing in ${Math.round(delay / 1000)}s (attempt ${resubAttempts})`);
+
+      resubTimer = setTimeout(() => {
+        resubTimer = null;
+        if (!listening) return;
+        console.log(`[${sessionId}] Resubscribing transcription...`);
+        display.showStatus('Reconnecting mic...', 2000);
+        subscribeTranscription();
+      }, delay);
+    };
+
+    const cancelResub = () => {
+      if (resubTimer) { clearTimeout(resubTimer); resubTimer = null; }
+      resubAttempts = 0;
+    };
+
     // ─── Start/Stop Listening ───
     const startListening = () => {
       if (listening) return;
@@ -536,17 +635,30 @@ class G1OpenClawBridge extends AppServer {
       console.log(`[${sessionId}] Mic ON`);
       display.showStatus('Listening...', 2000);
       updateDashboard();
-      unsubTranscription = session.events.onTranscription(handleTranscription);
+      subscribeTranscription();
     };
 
     const stopListening = () => {
       if (!listening) return;
       listening = false;
       console.log(`[${sessionId}] Mic OFF`);
-      if (unsubTranscription) { unsubTranscription(); unsubTranscription = null; }
+      cancelResub();
+      if (unsubTranscription) { try { unsubTranscription(); } catch (e) {} unsubTranscription = null; }
       display.showStatus('Mic off.', 2000);
       updateDashboard();
     };
+
+    const toggleMic = () => {
+      if (listening) stopListening();
+      else startListening();
+    };
+
+    // Register session for HTTP API access
+    activeSessions.set(sessionId, {
+      display,
+      toggleMic,
+      getMicState: () => listening,
+    });
 
     // ─── Phone Notifications (with dedup + blocklist + queue) ───
     const notifDedup = new NotificationDedup((app, count, lastBody) => {
@@ -587,9 +699,8 @@ class G1OpenClawBridge extends AppServer {
         headUpSince = Date.now();
         holdTimer = setTimeout(() => {
           if (headUpSince) {
-            console.log(`[${sessionId}] Head-up 6s → toggle`);
-            if (listening) stopListening();
-            else startListening();
+            console.log(`[${sessionId}] Head-up 5s → toggle`);
+            toggleMic();
           }
           headUpSince = null;
         }, HEAD_HOLD_MS);
@@ -614,6 +725,7 @@ class G1OpenClawBridge extends AppServer {
 
   protected async onStop(sessionId: string, userId: string, reason: string): Promise<void> {
     activeSessions.delete(sessionId);
+    // Note: watchdog cleanup happens naturally since the session is gone
     console.log(`[${sessionId}] Ended: ${reason}`);
   }
 }
@@ -621,7 +733,7 @@ class G1OpenClawBridge extends AppServer {
 // ─── Main ───
 
 async function main() {
-  console.log('G1-OpenClaw Bridge v0.7.0');
+  console.log('G1-OpenClaw Bridge v0.8.0');
   console.log(`  MentraOS: ${PACKAGE_NAME}`);
   console.log(`  OpenClaw: ${OPENCLAW_WS_URL}`);
   console.log(`  Ports: ${PORT} (MentraOS), ${PUSH_PORT} (Push API)`);
