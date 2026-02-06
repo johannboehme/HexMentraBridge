@@ -552,7 +552,9 @@ class G1OpenClawBridge extends AppServer {
       if (copilotMode) {
         console.log(`[${sessionId}] Copilot heard: "${userText}"`);
         const reply = await openclawClient.chat(userText, G1_COPILOT_PREFIX);
-        if (reply && reply.length > 0 && !reply.trim().startsWith('NO_REPLY') && !reply.trim().startsWith('NO_RE')) {
+        const copilotTrimmed = reply ? reply.trim() : '';
+        const copilotNoReply = !copilotTrimmed || /^NO[_]?R?E?P?L?Y?$/i.test(copilotTrimmed) || copilotTrimmed.startsWith('NO_REPLY') || copilotTrimmed.startsWith('NO_RE');
+        if (copilotTrimmed && !copilotNoReply) {
           console.log(`[${sessionId}] Copilot hint: "${reply.substring(0, 80)}"`);
           display.showReply(reply);
         } else {
@@ -570,11 +572,14 @@ class G1OpenClawBridge extends AppServer {
         () => display.showWaiting()
       );
 
-      if (reply && !reply.trim().startsWith('NO_REPLY') && !reply.trim().startsWith('NO_RE')) {
+      const trimmed = reply ? reply.trim() : '';
+      const isNoReply = !trimmed || /^NO[_]?R?E?P?L?Y?$/i.test(trimmed) || trimmed.startsWith('NO_REPLY') || trimmed.startsWith('NO_RE');
+      if (trimmed && !isNoReply) {
         console.log(`[${sessionId}] Hex: "${reply.substring(0, 80)}"`);
         display.showReply(reply);
       } else {
         console.log(`[${sessionId}] Hex: silent (NO_REPLY)`);
+        display.showStatus('', 100); // Clear the "Thinking..." display
       }
     };
 
