@@ -361,15 +361,27 @@ class NotificationDedup {
     const existing = this.pending.get(key);
 
     if (existing) {
+      // More notifications from same app within window — just count
       existing.count++;
       existing.lastBody = body;
-      return; // Timer is already running, will flush soon
+      // Reset timer so we batch everything within the window
+      clearTimeout(existing.timer);
+      existing.timer = setTimeout(() => {
+        this.pending.delete(key);
+        this.onFlush(app, existing.count, existing.lastBody);
+      }, NOTIF_DEDUP_WINDOW_MS);
+      return;
     }
 
-    // First notification from this app — start dedup window
-    const entry = { count: 1, lastBody: body, timer: setTimeout(() => {
+    // First notification — show immediately
+    this.onFlush(app, 1, body);
+
+    // Start dedup window for subsequent notifications from same app
+    const entry = { count: 0, lastBody: body, timer: setTimeout(() => {
       this.pending.delete(key);
-      this.onFlush(app, entry.count, entry.lastBody);
+      if (entry.count > 0) {
+        this.onFlush(app, entry.count, entry.lastBody);
+      }
     }, NOTIF_DEDUP_WINDOW_MS) };
 
     this.pending.set(key, entry);
