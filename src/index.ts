@@ -291,24 +291,110 @@ class G1OpenClawBridge extends AppServer {
     activeSessions.set(sessionId, display);
     display.showWelcome(openclawClient.isConnected() ? 'Hex connected.' : 'Hex offline.');
 
-    session.events.onTranscription(async (data) => {
-      if (!data.isFinal) return;
-      const userText = data.text.trim();
-      if (!userText) return;
+    // ─── Dashboard Card ───
+    try {
+      session.dashboard.content.write('Hex: Ready', ['main']);
+      console.log(`[${sessionId}] Dashboard card set.`);
+    } catch (e: any) {
+      console.log(`[${sessionId}] Dashboard card failed: ${e.message}`);
+    }
 
-      console.log(`[${sessionId}] User: "${userText}"`);
-      display.showThinking(userText);
+    // ─── Head-Up Toggle for Transcription ───
+    let listening = false;
+    let unsubTranscription: (() => void) | null = null;
 
-      const reply = await openclawClient.chat(
-        userText,
-        () => display.showWaiting()
-      );
+    const startListening = () => {
+      if (listening) return;
+      listening = true;
+      console.log(`[${sessionId}] Transcription ON`);
+      display.showStatus('Listening...', 2000);
 
-      console.log(`[${sessionId}] Hex: "${reply.substring(0, 80)}"`);
-      display.showReply(reply);
+      try {
+        session.dashboard.content.write('Hex: Listening...', ['main']);
+      } catch (e) {}
+
+      unsubTranscription = session.events.onTranscription(async (data) => {
+        if (!data.isFinal) return;
+        const userText = data.text.trim();
+        if (!userText) return;
+
+        console.log(`[${sessionId}] User: "${userText}"`);
+        display.showThinking(userText);
+
+        const reply = await openclawClient.chat(
+          userText,
+          () => display.showWaiting()
+        );
+
+        console.log(`[${sessionId}] Hex: "${reply.substring(0, 80)}"`);
+        display.showReply(reply);
+      });
+    };
+
+    const stopListening = () => {
+      if (!listening) return;
+      listening = false;
+      console.log(`[${sessionId}] Transcription OFF`);
+      if (unsubTranscription) { unsubTranscription(); unsubTranscription = null; }
+      display.showStatus('Mic off.', 2000);
+
+      try {
+        session.dashboard.content.write('Hex: Ready', ['main']);
+      } catch (e) {}
+    };
+
+    // ─── Phone Notifications → Display on glasses ───
+    // Smart truncation: App name as card title, content truncated to fit G1 display
+    // ~4 lines, ~40 chars/line = ~160 chars usable for body
+    const MAX_NOTIF_BODY = 150;
+    session.events.onPhoneNotifications((data: any) => {
+      const app = data.app || 'Notification';
+      const title = data.title || '';
+      const content = data.content || '';
+
+      // Build body: title + content, smartly truncated
+      let body = '';
+      if (title && content) {
+        body = `${title}: ${content}`;
+      } else {
+        body = title || content;
+      }
+
+      // Smart truncation: try to cut at word boundary
+      if (body.length > MAX_NOTIF_BODY) {
+        const cut = body.lastIndexOf(' ', MAX_NOTIF_BODY);
+        body = body.substring(0, cut > 80 ? cut : MAX_NOTIF_BODY) + '...';
+      }
+
+      console.log(`[${sessionId}] NOTIF: ${app} — ${body}`);
+      display.showNotification(`${app}\n${body}`, 10000);
     });
 
-    console.log(`[${sessionId}] Ready.`);
+    // ─── Head-Up Toggle (6s hold required) ───
+    const HOLD_DURATION_MS = 6000;
+    let headUpSince: number | null = null;
+    let holdTimer: ReturnType<typeof setTimeout> | null = null;
+
+    session.events.onHeadPosition((data: any) => {
+      if (data.position === 'up') {
+        headUpSince = Date.now();
+        // Start timer — toggle after 6s of sustained head-up
+        holdTimer = setTimeout(() => {
+          if (headUpSince) {
+            console.log(`[${sessionId}] Head-up held 6s → toggle`);
+            if (listening) stopListening();
+            else startListening();
+          }
+          headUpSince = null;
+        }, HOLD_DURATION_MS);
+      } else if (data.position === 'down') {
+        // Cancelled before 6s
+        headUpSince = null;
+        if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+      }
+    });
+
+    console.log(`[${sessionId}] Ready. Look up to toggle mic.`);
   }
 
   protected async onStop(sessionId: string, userId: string, reason: string): Promise<void> {
