@@ -717,6 +717,8 @@ function startPushServer() {
           lastTranscriptAt: s.lastTranscriptAt,
           lastTranscriptAgo: agoSec !== null ? formatAgo(agoSec) : null,
           lastTranscriptText: s.lastTranscriptText || null,
+          copilotQueueSize: s.copilotPipelineSize,  // flat field for Tasker
+          copilotInflight: s.copilotInflight,        // flat field for Tasker
           copilotPipeline: {
             size: s.copilotPipelineSize,       // transcripts currently in-flight (buffer + filter + opus)
             bufferSize: s.copilotBufferSize,   // waiting for debounce
