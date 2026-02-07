@@ -41,7 +41,7 @@ function generateBlackBitmap(): string {
   return buf.toString('base64');
 }
 const BLACK_BITMAP_B64 = generateBlackBitmap();
-const G1_COPILOT_PREFIX = '⚠️ G1 COPILOT MODE: The user is having a conversation nearby. You are listening silently. Do NOT respond directly. Instead, provide 1-2 short contextual hints, facts, or suggestions that might help the user. No markdown, no emojis. Ultra short.\n\nOverheard: ';
+const G1_COPILOT_PREFIX = '⚠️ G1 COPILOT MODE: The user is having a conversation nearby. You are listening silently. Respond ONLY when:\n- Someone states something factually wrong (fact-check it!)\n- You can add useful context (names, dates, prices, stats)\n- A term or concept could use a short definition\n- A question is asked that you can answer\n- You are directly addressed (Hex, hey Hex, etc.)\nOtherwise reply with NO_REPLY. No markdown, no emojis. Ultra short (1-2 sentences max).\n\nOverheard: ';
 const SOFT_TIMEOUT_MS = 45_000;
 const HARD_TIMEOUT_MS = 300_000;
 const RECONNECT_DELAY_MS = 5_000;
