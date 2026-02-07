@@ -1,6 +1,8 @@
 import { AppServer, AppSession } from '@mentra/sdk';
 import { WebSocket } from 'ws';
 import { createServer, IncomingMessage, ServerResponse } from 'http';
+import { mkdirSync, appendFileSync } from 'fs';
+import { join } from 'path';
 
 const PACKAGE_NAME = process.env.PACKAGE_NAME ?? (() => { throw new Error('PACKAGE_NAME not set'); })();
 const MENTRAOS_API_KEY = process.env.MENTRAOS_API_KEY ?? (() => { throw new Error('MENTRAOS_API_KEY not set'); })();
@@ -11,9 +13,104 @@ const PUSH_TOKEN = process.env.PUSH_TOKEN || '';  // Optional auth token for ext
 const OPENCLAW_WS_URL = process.env.OPENCLAW_WS_URL || 'ws://localhost:18789';
 const OPENCLAW_GW_TOKEN = process.env.OPENCLAW_GW_TOKEN || '';
 
+// Copilot LLM Filter (e.g. Azure-hosted Haiku)
+const FILTER_LLM_URL = process.env.FILTER_LLM_URL || '';
+const FILTER_LLM_API_KEY = process.env.FILTER_LLM_API_KEY || '';
+const FILTER_LLM_MODEL = process.env.FILTER_LLM_MODEL || 'haiku';
+
 // Notification blocklist: comma-separated app names (case-insensitive)
 const NOTIF_BLOCKLIST = (process.env.NOTIF_BLOCKLIST || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+// ─── Transcript Logger ───
+
+const TRANSCRIPTS_DIR = join(import.meta.dir, '..', 'transcripts');
+mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
+
+function logTranscript(mode: 'normal' | 'copilot', text: string, filterResult?: 'RELEVANT' | 'SKIP' | 'ERROR') {
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10); // YYYY-MM-DD
+  const timeStr = now.toISOString().slice(11, 19); // HH:MM:SS
+  const filePath = join(TRANSCRIPTS_DIR, `${dateStr}.md`);
+
+  let line = `[${timeStr}] (${mode})`;
+  if (filterResult) line += ` [${filterResult}]`;
+  line += ` ${text}\n`;
+
+  try { appendFileSync(filePath, line); } catch (e: any) {
+    console.error(`[Transcript] Write error: ${e.message}`);
+  }
+}
+
+// ─── Copilot LLM Filter ───
+
+const FILTER_SYSTEM_PROMPT = `You are a relevance filter for an AI assistant named "Hex" that silently listens to conversations through smart glasses. Your job: decide if the overheard text needs AI attention.
+
+Reply RELEVANT if:
+- The AI assistant is being addressed directly and unambiguously (e.g. "Hex", "Hey Hex", "Hex, wie spät ist es?"). Only trigger for the AI's name, NOT when any other person is addressed by their name.
+- A factual claim is made that could be wrong or worth verifying
+- A question is asked (even rhetorical ones about facts, prices, dates)
+- Numbers, prices, dates, or statistics are mentioned that could be checked
+- A term or concept might need a short explanation or definition
+- Someone refers to past conversation ("what did we say about...", "was war nochmal...")
+
+Reply SKIP if:
+- Casual chitchat, greetings, filler words, small talk
+- Emotional expressions without factual content
+- Garbled, unclear, or fragmentary transcription
+- Single words or meaningless fragments ("Hm", "Na", ".")
+- Movie, TV, podcast, or video game audio playing in background
+- People addressing each other by name (not the AI)
+- Statements that don't benefit from additional context or fact-checking
+
+Reply with ONLY the word "RELEVANT" or "SKIP". Nothing else.`;
+
+async function filterWithLLM(text: string): Promise<'RELEVANT' | 'SKIP' | 'ERROR'> {
+  if (!FILTER_LLM_URL || !FILTER_LLM_API_KEY) {
+    // No filter configured — pass everything through (backwards compatible)
+    return 'RELEVANT';
+  }
+
+  try {
+    // Azure Anthropic API (Messages format, not OpenAI-compatible)
+    const res = await fetch(FILTER_LLM_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': FILTER_LLM_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: FILTER_LLM_MODEL,
+        system: FILTER_SYSTEM_PROMPT,
+        messages: [
+          { role: 'user', content: text },
+        ],
+        max_tokens: 5,
+        temperature: 0,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!res.ok) {
+      console.error(`[Filter] HTTP ${res.status}: ${await res.text().catch(() => '')}`);
+      return 'ERROR';
+    }
+
+    const data = await res.json() as any;
+    // Anthropic Messages API: content is array of {type, text}
+    const reply = (data.content?.[0]?.text || '').trim().toUpperCase();
+
+    if (reply.startsWith('RELEVANT')) return 'RELEVANT';
+    if (reply.startsWith('SKIP')) return 'SKIP';
+
+    console.warn(`[Filter] Unexpected reply: "${reply}" — defaulting to RELEVANT`);
+    return 'RELEVANT';
+  } catch (e: any) {
+    console.error(`[Filter] Error: ${e.message}`);
+    return 'ERROR';  // On error, let it through (fail open)
+  }
+}
 
 const G1_PREFIX = '⚠️ G1 BRIDGE DISPLAY: Use only 2-3 short sentences, no markdown, no emojis!\n\n';
 
@@ -92,7 +189,7 @@ class OpenClawClient {
           type: 'req', id: connId, method: 'connect',
           params: {
             minProtocol: 3, maxProtocol: 3,
-            client: { id: 'gateway-client', displayName: 'G1 Bridge', version: '0.8.1', platform: 'linux', mode: 'cli' },
+            client: { id: 'gateway-client', displayName: 'G1 Bridge', version: '0.9.0', platform: 'linux', mode: 'cli' },
             auth: { token: OPENCLAW_GW_TOKEN },
           },
         });
@@ -481,8 +578,11 @@ type SessionHandle = {
   getDebugStatus: () => {
     lastTranscriptAt: number | null;
     lastTranscriptText: string;
-    copilotQueueSize: number;
+    copilotBufferSize: number;
+    copilotPipelineSize: number;
     copilotInflight: boolean;
+    copilotFilteredCount: number;
+    copilotPassedCount: number;
     listening: boolean;
     copilot: boolean;
   };
@@ -608,11 +708,8 @@ function startPushServer() {
         const s = h.getDebugStatus();
         const agoSec = s.lastTranscriptAt ? Math.round((Date.now() - s.lastTranscriptAt) / 1000) : null;
 
-        // Progress: queue fill (each item = 20%, caps at 100)
-        // Inflight counts as 1 item too
-        let progress = 0;
-        if (s.copilotInflight) progress = Math.min((1 + s.copilotQueueSize) * 20, 100);
-        else if (s.copilotQueueSize > 0) progress = Math.min(s.copilotQueueSize * 20, 100);
+        // Progress: pipeline size (each item = 20%, caps at 100)
+        const progress = Math.min(s.copilotPipelineSize * 20, 100);
 
         sessions[id] = {
           listening: s.listening,
@@ -620,8 +717,13 @@ function startPushServer() {
           lastTranscriptAt: s.lastTranscriptAt,
           lastTranscriptAgo: agoSec !== null ? formatAgo(agoSec) : null,
           lastTranscriptText: s.lastTranscriptText || null,
-          copilotQueueSize: s.copilotQueueSize,
-          copilotInflight: s.copilotInflight,
+          copilotPipeline: {
+            size: s.copilotPipelineSize,       // transcripts currently in-flight (buffer + filter + opus)
+            bufferSize: s.copilotBufferSize,   // waiting for debounce
+            inflight: s.copilotInflight,       // currently being processed by filter/opus
+            totalFiltered: s.copilotFilteredCount,  // lifetime SKIP count
+            totalPassed: s.copilotPassedCount,      // lifetime RELEVANT count
+          },
           progress,
         };
       }
@@ -668,7 +770,20 @@ class G1OpenClawBridge extends AppServer {
 
     const COPILOT_TIMEOUT_MS = 60_000;  // 60s max for copilot responses
 
+    // Pipeline tracking: counts transcripts from arrival to completion
+    // Increments when a transcript enters copilot buffer
+    // Decrements when filter rejects (SKIP) or Opus finishes processing
+    let copilotPipelineSize = 0;
+    let copilotFilteredCount = 0;   // Total filtered out (SKIP) since session start
+    let copilotPassedCount = 0;     // Total passed to Opus since session start
+
+    // Sliding window of recent transcripts for context when RELEVANT
+    // Stores all copilot transcripts (including SKIPs) so Opus gets conversation context
+    const CONTEXT_WINDOW_SIZE = 5;
+    const copilotContextWindow: string[] = [];
+
     // Copilot batch processor — serializes requests, never drops buffered text
+    // Now with LLM pre-filter: cheap model decides if Opus needs to see it
     const sendCopilotBatch = async () => {
       if (copilotBuffer.length === 0) return;
       if (copilotInflight) {
@@ -676,15 +791,51 @@ class G1OpenClawBridge extends AppServer {
         return;
       }
 
+      // Count how many transcripts are in this batch (for pipeline tracking)
+      const batchItemCount = copilotBuffer.length;
       const batch = copilotBuffer.join(' ');
       copilotBuffer = [];
 
+      // ─── LLM Pre-Filter ───
+      console.log(`[${sessionId}] Copilot filter (${batchItemCount} items, pipeline=${copilotPipelineSize}): "${batch.substring(0, 80)}"`);
+      const filterResult = await filterWithLLM(batch);
+      logTranscript('copilot', batch, filterResult);
+
+      // Always add to context window (even SKIPs — they're valuable conversation context)
+      copilotContextWindow.push(batch);
+      while (copilotContextWindow.length > CONTEXT_WINDOW_SIZE) copilotContextWindow.shift();
+
+      if (filterResult === 'SKIP') {
+        copilotPipelineSize = Math.max(0, copilotPipelineSize - batchItemCount);
+        copilotFilteredCount += batchItemCount;
+        console.log(`[${sessionId}] Copilot: filtered out (SKIP) — pipeline=${copilotPipelineSize} filtered=${copilotFilteredCount}`);
+        drainBuffer();  // Process any buffered items that arrived during filter call
+        return;
+      }
+
+      // ERROR or RELEVANT → send to Opus (fail open)
+      if (filterResult === 'ERROR') {
+        console.log(`[${sessionId}] Copilot: filter error, passing through to Opus`);
+      }
+
+      // Build message with context window (previous transcripts for conversation context)
+      // The current batch is the last entry in the window, previous entries are context
+      let messageForOpus = batch;
+      if (copilotContextWindow.length > 1) {
+        const prevContext = copilotContextWindow.slice(0, -1);  // everything except current
+        messageForOpus = 'Recent conversation context:\n' +
+          prevContext.map(t => `- ${t}`).join('\n') +
+          '\n\nCurrent: ' + batch;
+      }
+
       copilotInflight = true;
+      copilotPassedCount += batchItemCount;
 
       // Safety timeout — if chat() never resolves, force-unlock after 60s
       const safetyTimer = setTimeout(() => {
         if (copilotInflight) {
           console.log(`[${sessionId}] Copilot: safety timeout (${COPILOT_TIMEOUT_MS / 1000}s)`);
+          copilotPipelineSize = Math.max(0, copilotPipelineSize - batchItemCount);
           copilotInflight = false;
           openclawClient.cancelPendingRuns();
           drainBuffer();
@@ -692,18 +843,20 @@ class G1OpenClawBridge extends AppServer {
       }, COPILOT_TIMEOUT_MS);
 
       try {
-        const reply = await openclawClient.chat(batch, G1_COPILOT_PREFIX);
+        const reply = await openclawClient.chat(messageForOpus, G1_COPILOT_PREFIX);
         clearTimeout(safetyTimer);
+        copilotPipelineSize = Math.max(0, copilotPipelineSize - batchItemCount);
         const t = reply ? reply.trim() : '';
         const skip = !t || /^NO[_]?R?E?P?L?Y?$/i.test(t) || t.startsWith('NO_REPLY') || t.startsWith('NO_RE');
         if (t && !skip) {
-          console.log(`[${sessionId}] Copilot hint: "${t.substring(0, 80)}"`);
+          console.log(`[${sessionId}] Copilot hint (pipeline=${copilotPipelineSize}): "${t.substring(0, 80)}"`);
           display.showReply(t);
         } else {
-          console.log(`[${sessionId}] Copilot: nothing to show`);
+          console.log(`[${sessionId}] Copilot: nothing to show (pipeline=${copilotPipelineSize})`);
         }
       } catch (e: any) {
         clearTimeout(safetyTimer);
+        copilotPipelineSize = Math.max(0, copilotPipelineSize - batchItemCount);
         console.error(`[${sessionId}] Copilot error: ${e.message}`);
       } finally {
         copilotInflight = false;
@@ -761,6 +914,8 @@ class G1OpenClawBridge extends AppServer {
         // Clear copilot state on toggle
         if (copilotDebounceTimer) { clearTimeout(copilotDebounceTimer); copilotDebounceTimer = null; }
         copilotBuffer = [];
+        copilotPipelineSize = 0;
+        copilotContextWindow.length = 0;
         display.showStatus(state, 3000);
         updateDashboard();
         return;
@@ -770,6 +925,7 @@ class G1OpenClawBridge extends AppServer {
       if (copilotMode) {
         console.log(`[${sessionId}] Copilot heard: "${userText}"`);
         copilotBuffer.push(userText);
+        copilotPipelineSize++;
 
         // Reset debounce timer — wait for a pause in speech
         if (copilotDebounceTimer) clearTimeout(copilotDebounceTimer);
@@ -780,7 +936,8 @@ class G1OpenClawBridge extends AppServer {
         return;
       }
 
-      // Normal mode
+      // Normal mode — log and send directly to Opus (no filter)
+      logTranscript('normal', userText);
       console.log(`[${sessionId}] User: "${userText}"`);
       display.showThinking(userText);
 
@@ -886,6 +1043,8 @@ class G1OpenClawBridge extends AppServer {
         console.log(`[${sessionId}] ${state} (via API)`);
         if (copilotDebounceTimer) { clearTimeout(copilotDebounceTimer); copilotDebounceTimer = null; }
         copilotBuffer = [];
+        copilotPipelineSize = 0;
+        copilotContextWindow.length = 0;
         display.showStatus(state, 3000);
         updateDashboard();
         return copilotMode;
@@ -894,8 +1053,11 @@ class G1OpenClawBridge extends AppServer {
       getDebugStatus: () => ({
         lastTranscriptAt,
         lastTranscriptText,
-        copilotQueueSize: copilotBuffer.length,
+        copilotBufferSize: copilotBuffer.length,
+        copilotPipelineSize,
         copilotInflight,
+        copilotFilteredCount,
+        copilotPassedCount,
         listening,
         copilot: copilotMode,
       }),
@@ -974,10 +1136,12 @@ class G1OpenClawBridge extends AppServer {
 // ─── Main ───
 
 async function main() {
-  console.log('G1-OpenClaw Bridge v0.8.1');
+  console.log('G1-OpenClaw Bridge v0.9.0');
   console.log(`  MentraOS: ${PACKAGE_NAME}`);
   console.log(`  OpenClaw: ${OPENCLAW_WS_URL}`);
   console.log(`  Ports: ${PORT} (MentraOS), ${PUSH_PORT} (Push API)`);
+  console.log(`  Transcripts: ${TRANSCRIPTS_DIR}`);
+  console.log(`  Copilot filter: ${FILTER_LLM_URL ? `${FILTER_LLM_MODEL} @ ${FILTER_LLM_URL}` : 'DISABLED (no FILTER_LLM_URL)'}`);
   if (NOTIF_BLOCKLIST.length > 0) {
     console.log(`  Notification blocklist: ${NOTIF_BLOCKLIST.join(', ')}`);
   }
