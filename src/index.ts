@@ -311,19 +311,20 @@ class OpenClawClient {
             console.log(`[OpenClaw] agent lifecycle: phase=${pl?.data?.phase} runId=${pl?.runId} idemKey=${pl?.data?.idempotencyKey || 'none'} idemPending=${this._pendingIdempotencyCallbacks.size} listeners=${this.runListeners.size}`);
           }
           if (pl?.stream === 'lifecycle' && pl?.data?.phase === 'start' && pl?.runId) {
-            // Try to match by idempotencyKey first (reliable, no stealing)
+            // Primary matching: chat.send response returns runId → listener registered there.
+            // Fallback: if OpenClaw ever includes idempotencyKey in phase:start events, use that.
             const idemKey = pl?.data?.idempotencyKey || pl?.idempotencyKey;
             if (idemKey && this._pendingIdempotencyCallbacks.has(idemKey)) {
               const cb = this._pendingIdempotencyCallbacks.get(idemKey)!;
               this._pendingIdempotencyCallbacks.delete(idemKey);
               this.runListeners.set(pl.runId, cb);
-              console.log(`[OpenClaw] matched runId=${pl.runId} via idemKey=${idemKey} (remaining idemPending=${this._pendingIdempotencyCallbacks.size})`);
-            } else if (idemKey && idemKey.startsWith('g1-') && !this.runListeners.has(pl.runId)) {
-              // It's a g1 message but callback was already matched via chat.send response — skip
-              console.log(`[OpenClaw] runId=${pl.runId} idemKey=${idemKey} already matched or no pending callback`);
-            } else if (!idemKey) {
-              // Internal OpenClaw run (compaction, memory-flush, etc.) — ignore, don't steal callbacks
-              console.log(`[OpenClaw] ignoring internal run runId=${pl.runId} (no idemKey)`);
+              console.log(`[OpenClaw] matched runId=${pl.runId} via idemKey=${idemKey} (idemPending=${this._pendingIdempotencyCallbacks.size})`);
+            } else if (this.runListeners.has(pl.runId)) {
+              // Already matched via chat.send response — normal path
+              console.log(`[OpenClaw] runId=${pl.runId} already has listener (matched via chat.send response)`);
+            } else {
+              // Unmatched run (internal OpenClaw: compaction, memory-flush, Telegram, etc.) — ignore
+              console.log(`[OpenClaw] ignoring unmatched run runId=${pl.runId} (no callback)`);
             }
           }
           // If run ended but we never got a chat event, resolve with empty (NO_REPLY)
@@ -857,7 +858,7 @@ class G1OpenClawBridge extends AppServer {
     let copilotBuffer: string[] = [];
     let copilotDebounceTimer: ReturnType<typeof setTimeout> | null = null;
     let copilotInflight = false;
-    const COPILOT_DEBOUNCE_MS = 2_500;  // Batch transcripts over 2.5s window
+    const COPILOT_DEBOUNCE_MS = 2_000;  // Batch transcripts over 2s window
     let unsubTranscription: (() => void) | null = null;
     let resubAttempts = 0;
     let lastTranscriptAt: number | null = null;
