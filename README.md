@@ -96,7 +96,7 @@ Open the MentraOS app on your phone → start your app → the glasses should sh
 | Command | What it does |
 |---------|-------------|
 | *Any question or statement* | Sends to your AI, shows reply on display |
-| "Copilot mode" / "Copilot on" / "Copilot off" | Toggle copilot mode |
+| "Copilot mode" / "Copilot on/off" / "Copilot an/aus" | Toggle copilot mode |
 | "New session" / "Neue Session" | Reset the AI conversation |
 
 ### Head gestures
@@ -107,6 +107,8 @@ Open the MentraOS app on your phone → start your app → the glasses should sh
 ### Copilot Mode
 
 In copilot mode, the AI listens to your conversations but stays silent. It only shows a brief hint on the display when it has something genuinely useful to add — a fact check, a name, a relevant detail. Perfect for meetings or conversations where you want background context without interruption.
+
+Transcripts are **debounced** (batched over 3-second windows) to avoid flooding the AI with every sentence fragment. If the AI is busy researching something, new transcripts queue up and get processed after the current request finishes — nothing gets lost or cancelled.
 
 ### Push API
 
@@ -131,9 +133,22 @@ curl -X POST http://localhost:3001/push-bitmap \
 curl -X POST http://localhost:3001/mic
 ```
 
+**Copilot toggle (for Tasker/WearOS):**
+```bash
+curl -X POST http://localhost:3001/copilot
+# → {"ok":true,"sessions":1,"copilot":true}
+```
+
+**Copilot status:**
+```bash
+curl http://localhost:3001/copilot
+# → {"ok":true,"sessions":1,"copilot":false}
+```
+
 **Status check:**
 ```bash
 curl http://localhost:3001/status
+# → {"ok":true,"openclaw":true,"sessions":1,"listening":false,"copilot":false}
 ```
 
 If `PUSH_TOKEN` is set, add `Authorization: Bearer <token>` header or `?token=<token>` query param.
@@ -265,6 +280,9 @@ curl -s -X POST http://127.0.0.1:3001/push \
 
 # Toggle mic remotely
 curl -s -X POST http://127.0.0.1:3001/mic
+
+# Toggle copilot mode
+curl -s -X POST http://127.0.0.1:3001/copilot
 ```
 
 Use push for calendar reminders, urgent notifications, weather alerts, or anything time-sensitive.
