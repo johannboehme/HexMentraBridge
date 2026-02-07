@@ -233,7 +233,7 @@ class OpenClawClient {
   private reqId = 0;
   private pending = new Map<string, { resolve: (v: any) => void; reject: (e: any) => void }>();
   private runListeners = new Map<string, (text: string) => void>();
-  private _pendingRunCallbacks: Array<(text: string) => void> = [];  // FIFO queue for matching run callbacks
+  private _pendingIdempotencyCallbacks = new Map<string, (text: string) => void>();  // idemKey → callback
   private reconnectDelay = RECONNECT_DELAY_MS;
   private shouldReconnect = true;
 
@@ -297,7 +297,7 @@ class OpenClawClient {
             let text = '';
             if (Array.isArray(content)) text = content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('');
             else if (typeof content === 'string') text = content;
-            console.log(`[OpenClaw] chat final: runId=${pl.runId} text="${(text||'').substring(0,60)}" hasListener=${pl.runId ? this.runListeners.has(pl.runId) : 'no-runId'} pendingCbs=${this._pendingRunCallbacks.length} listeners=${this.runListeners.size}`);
+            console.log(`[OpenClaw] chat final: runId=${pl.runId} text="${(text||'').substring(0,60)}" hasListener=${pl.runId ? this.runListeners.has(pl.runId) : 'no-runId'} idemPending=${this._pendingIdempotencyCallbacks.size} listeners=${this.runListeners.size}`);
             if (text && pl.runId) {
               const cb = this.runListeners.get(pl.runId);
               if (cb) { this.runListeners.delete(pl.runId); cb(text); }
@@ -308,12 +308,23 @@ class OpenClawClient {
         if (msg.type === 'event' && msg.event === 'agent') {
           const pl = msg.payload;
           if (pl?.stream === 'lifecycle') {
-            console.log(`[OpenClaw] agent lifecycle: phase=${pl?.data?.phase} runId=${pl?.runId} pendingCbs=${this._pendingRunCallbacks.length}`);
+            console.log(`[OpenClaw] agent lifecycle: phase=${pl?.data?.phase} runId=${pl?.runId} idemKey=${pl?.data?.idempotencyKey || 'none'} idemPending=${this._pendingIdempotencyCallbacks.size} listeners=${this.runListeners.size}`);
           }
-          if (pl?.stream === 'lifecycle' && pl?.data?.phase === 'start' && pl?.runId && this._pendingRunCallbacks.length > 0) {
-            const cb = this._pendingRunCallbacks.shift()!;
-            this.runListeners.set(pl.runId, cb);
-            console.log(`[OpenClaw] matched runId=${pl.runId} → listener (remaining pendingCbs=${this._pendingRunCallbacks.length})`);
+          if (pl?.stream === 'lifecycle' && pl?.data?.phase === 'start' && pl?.runId) {
+            // Try to match by idempotencyKey first (reliable, no stealing)
+            const idemKey = pl?.data?.idempotencyKey || pl?.idempotencyKey;
+            if (idemKey && this._pendingIdempotencyCallbacks.has(idemKey)) {
+              const cb = this._pendingIdempotencyCallbacks.get(idemKey)!;
+              this._pendingIdempotencyCallbacks.delete(idemKey);
+              this.runListeners.set(pl.runId, cb);
+              console.log(`[OpenClaw] matched runId=${pl.runId} via idemKey=${idemKey} (remaining idemPending=${this._pendingIdempotencyCallbacks.size})`);
+            } else if (idemKey && idemKey.startsWith('g1-') && !this.runListeners.has(pl.runId)) {
+              // It's a g1 message but callback was already matched via chat.send response — skip
+              console.log(`[OpenClaw] runId=${pl.runId} idemKey=${idemKey} already matched or no pending callback`);
+            } else if (!idemKey) {
+              // Internal OpenClaw run (compaction, memory-flush, etc.) — ignore, don't steal callbacks
+              console.log(`[OpenClaw] ignoring internal run runId=${pl.runId} (no idemKey)`);
+            }
           }
           // If run ended but we never got a chat event, resolve with empty (NO_REPLY)
           if (pl?.stream === 'lifecycle' && pl?.data?.phase === 'end' && pl?.runId && this.runListeners.has(pl.runId)) {
@@ -342,7 +353,7 @@ class OpenClawClient {
           p.reject(new Error('WS closed'));
         }
         this.pending.clear();
-        this._pendingRunCallbacks = [];
+        this._pendingIdempotencyCallbacks.clear();
         this.runListeners.clear();
         this.scheduleReconnect();
       });
@@ -376,28 +387,40 @@ class OpenClawClient {
     return new Promise(async (resolve) => {
       let resolved = false;
       const done = (text: string) => { if (!resolved) { resolved = true; resolve(text); } };
+      const idemKey = `g1-${Date.now()}`;
+
+      // Register callback keyed by idempotencyKey — will be matched when we get runId
       const cb = (text: string) => done(text);
-      this._pendingRunCallbacks.push(cb);
+      this._pendingIdempotencyCallbacks.set(idemKey, cb);
+
       try {
-        await this.request('chat.send', {
+        const res = await this.request('chat.send', {
           message: prefix + message,
           sessionKey: 'agent:main:main',
-          idempotencyKey: `g1-${Date.now()}`,
+          idempotencyKey: idemKey,
         });
+        // If chat.send returns a runId directly, register the listener immediately
+        if (res?.runId) {
+          this._pendingIdempotencyCallbacks.delete(idemKey);
+          this.runListeners.set(res.runId, cb);
+          console.log(`[OpenClaw] chat.send returned runId=${res.runId} for idem=${idemKey}`);
+        } else {
+          console.log(`[OpenClaw] chat.send no runId in response for idem=${idemKey}, waiting for phase:start`);
+        }
       } catch (err: any) {
         console.error('[OpenClaw] chat.send failed:', err.message);
-        // Remove our callback from the queue
-        const idx = this._pendingRunCallbacks.indexOf(cb);
-        if (idx >= 0) this._pendingRunCallbacks.splice(idx, 1);
+        this._pendingIdempotencyCallbacks.delete(idemKey);
         done('Failed to reach Hex');
         return;
       }
       setTimeout(() => { if (!resolved) { onSoftTimeout?.(); } }, SOFT_TIMEOUT_MS);
       setTimeout(() => {
         if (!resolved) {
-          // Remove our callback from the queue if still there
-          const idx = this._pendingRunCallbacks.indexOf(cb);
-          if (idx >= 0) this._pendingRunCallbacks.splice(idx, 1);
+          this._pendingIdempotencyCallbacks.delete(idemKey);
+          // Also remove from runListeners if it was matched
+          for (const [runId, listener] of this.runListeners) {
+            if (listener === cb) { this.runListeners.delete(runId); break; }
+          }
           done('Hex braucht zu lange.');
         }
       }, HARD_TIMEOUT_MS);
@@ -406,10 +429,10 @@ class OpenClawClient {
 
   /** Cancel all pending run callbacks (used when copilot debounce supersedes old requests) */
   cancelPendingRuns() {
-    for (const cb of this._pendingRunCallbacks) {
+    for (const [key, cb] of this._pendingIdempotencyCallbacks) {
       cb('');  // resolve with empty → treated as NO_REPLY
     }
-    this._pendingRunCallbacks = [];
+    this._pendingIdempotencyCallbacks.clear();
     // Also cancel any already-matched run listeners
     for (const [runId, cb] of this.runListeners) {
       cb('');
