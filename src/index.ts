@@ -18,6 +18,11 @@ const FILTER_LLM_URL = process.env.FILTER_LLM_URL || '';
 const FILTER_LLM_API_KEY = process.env.FILTER_LLM_API_KEY || '';
 const FILTER_LLM_MODEL = process.env.FILTER_LLM_MODEL || 'haiku';
 
+// Assistant name for keyword-based filter bypass (case-insensitive)
+// When the assistant's name appears in a copilot transcript, skip the LLM filter
+// and send directly to the main AI. Configurable for other setups.
+const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'Hex';
+
 // Notification blocklist: comma-separated app names (case-insensitive)
 const NOTIF_BLOCKLIST = (process.env.NOTIF_BLOCKLIST || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -95,10 +100,10 @@ function traceFinish(trace: TimingTrace) {
 
 // ─── Copilot LLM Filter ───
 
-const FILTER_SYSTEM_PROMPT = `You are a relevance filter for an AI assistant named "Hex" that silently listens to conversations through smart glasses. Your job: decide if the overheard text needs AI attention.
+const FILTER_SYSTEM_PROMPT = `You are a relevance filter for an AI assistant named "${ASSISTANT_NAME}" that silently listens to conversations through smart glasses. Your job: decide if the overheard text needs AI attention.
 
 Reply RELEVANT if:
-- The AI assistant is being addressed directly and unambiguously (e.g. "Hex", "Hey Hex", "Hex, wie spät ist es?"). Only trigger for the AI's name, NOT when any other person is addressed by their name.
+- The AI assistant is being addressed directly and unambiguously (e.g. "${ASSISTANT_NAME}", "Hey ${ASSISTANT_NAME}", "${ASSISTANT_NAME}, wie spät ist es?"). Only trigger for the AI's name, NOT when any other person is addressed by their name.
 - A factual claim is made that could be wrong or worth verifying
 - A question is asked (even rhetorical ones about facts, prices, dates)
 - Numbers, prices, dates, or statistics are mentioned that could be checked
@@ -163,6 +168,20 @@ async function filterWithLLM(text: string): Promise<'RELEVANT' | 'SKIP' | 'ERROR
   }
 }
 
+// ─── Assistant Name Keyword Detector ───
+// Checks if the transcript likely addresses the assistant by name.
+// Uses word-boundary matching to avoid false positives (e.g. "hexagonal").
+// Case-insensitive, handles common STT artifacts like "hex," "hey hex", "hex!".
+
+function containsAssistantName(text: string): boolean {
+  if (!ASSISTANT_NAME) return false;
+  const name = ASSISTANT_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // escape regex chars
+  // Match name as a whole word: preceded by start/space/punctuation, followed by end/space/punctuation
+  // This catches: "Hex, ...", "Hey Hex", "...hex!", "Hex wann...", but NOT "hexagonal", "verhext"
+  const pattern = new RegExp(`(?:^|[\\s,.!?;:'"()])${name}(?=[\\s,.!?;:'"()!]|$)`, 'i');
+  return pattern.test(text);
+}
+
 const G1_PREFIX = '⚠️ G1 BRIDGE DISPLAY: Use only 2-3 short sentences, no markdown, no emojis!\n\n';
 
 // Generate a minimal black 526x100 24-bit BMP as base64 for clearing green line artifacts
@@ -189,7 +208,7 @@ function generateBlackBitmap(): string {
   return buf.toString('base64');
 }
 const BLACK_BITMAP_B64 = generateBlackBitmap();
-const G1_COPILOT_PREFIX = '⚠️ G1 COPILOT MODE: The user is having a conversation nearby. You are listening silently. Respond ONLY when:\n- Someone states something factually wrong (fact-check it!)\n- You can add useful context (names, dates, prices, stats)\n- A term or concept could use a short definition\n- A question is asked that you can answer\n- You are directly addressed (Hex, hey Hex, etc.)\nOtherwise reply with NO_REPLY. No markdown, no emojis. Ultra short (1-2 sentences max).\n\nOverheard: ';
+const G1_COPILOT_PREFIX = `⚠️ G1 COPILOT MODE: The user is having a conversation nearby. You are listening silently. Respond ONLY when:\n- Someone states something factually wrong (fact-check it!)\n- You can add useful context (names, dates, prices, stats)\n- A term or concept could use a short definition\n- A question is asked that you can answer\n- You are directly addressed (${ASSISTANT_NAME}, hey ${ASSISTANT_NAME}, etc.)\nOtherwise reply with NO_REPLY. No markdown, no emojis. Ultra short (1-2 sentences max).\n\nOverheard: `;
 const SOFT_TIMEOUT_MS = 45_000;
 const HARD_TIMEOUT_MS = 300_000;
 const RECONNECT_DELAY_MS = 5_000;
@@ -815,7 +834,7 @@ class G1OpenClawBridge extends AppServer {
     let copilotBuffer: string[] = [];
     let copilotDebounceTimer: ReturnType<typeof setTimeout> | null = null;
     let copilotInflight = false;
-    const COPILOT_DEBOUNCE_MS = 3_000;  // Batch transcripts over 3s window
+    const COPILOT_DEBOUNCE_MS = 2_500;  // Batch transcripts over 2.5s window
     let unsubTranscription: (() => void) | null = null;
     let resubAttempts = 0;
     let lastTranscriptAt: number | null = null;
@@ -852,13 +871,24 @@ class G1OpenClawBridge extends AppServer {
       const trace = createTrace('copilot', batch);
       traceStep(trace, 'debounce_done');
 
-      // ─── LLM Pre-Filter ───
-      console.log(`[${sessionId}] Copilot filter (${batchItemCount} items, pipeline=${copilotPipelineSize}): "${batch.substring(0, 80)}"`);
-      traceStep(trace, 'filter_start');
-      const filterResult = await filterWithLLM(batch);
-      traceStep(trace, 'filter_done');
-      trace.filterResult = filterResult;
-      logTranscript('copilot', batch, filterResult);
+      // ─── Keyword Bypass: skip LLM filter if assistant name detected ───
+      const nameDetected = containsAssistantName(batch);
+      let filterResult: 'RELEVANT' | 'SKIP' | 'ERROR';
+
+      if (nameDetected) {
+        console.log(`[${sessionId}] Copilot: "${ASSISTANT_NAME}" detected — skipping filter (${batchItemCount} items, pipeline=${copilotPipelineSize}): "${batch.substring(0, 80)}"`);
+        traceStep(trace, 'keyword_bypass');
+        filterResult = 'RELEVANT';
+        logTranscript('copilot', batch, filterResult);
+      } else {
+        // ─── LLM Pre-Filter ───
+        console.log(`[${sessionId}] Copilot filter (${batchItemCount} items, pipeline=${copilotPipelineSize}): "${batch.substring(0, 80)}"`);
+        traceStep(trace, 'filter_start');
+        filterResult = await filterWithLLM(batch);
+        traceStep(trace, 'filter_done');
+        logTranscript('copilot', batch, filterResult);
+      }
+      trace.filterResult = nameDetected ? `BYPASS(${ASSISTANT_NAME})` : filterResult;
 
       // Always add to context window (even SKIPs — they're valuable conversation context)
       copilotContextWindow.push(batch);
@@ -1216,6 +1246,7 @@ async function main() {
   console.log(`  Ports: ${PORT} (MentraOS), ${PUSH_PORT} (Push API)`);
   console.log(`  Transcripts: ${TRANSCRIPTS_DIR}`);
   console.log(`  Copilot filter: ${FILTER_LLM_URL ? `${FILTER_LLM_MODEL} @ ${FILTER_LLM_URL}` : 'DISABLED (no FILTER_LLM_URL)'}`);
+  console.log(`  Assistant name: "${ASSISTANT_NAME}" (keyword bypass for copilot filter)`);
   if (NOTIF_BLOCKLIST.length > 0) {
     console.log(`  Notification blocklist: ${NOTIF_BLOCKLIST.join(', ')}`);
   }
