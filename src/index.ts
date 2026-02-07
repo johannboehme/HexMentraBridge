@@ -25,7 +25,9 @@ const NOTIF_BLOCKLIST = (process.env.NOTIF_BLOCKLIST || '')
 // ─── Transcript Logger ───
 
 const TRANSCRIPTS_DIR = join(import.meta.dir, '..', 'transcripts');
+const TIMING_DIR = join(import.meta.dir, '..', 'timing');
 mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
+mkdirSync(TIMING_DIR, { recursive: true });
 
 function logTranscript(mode: 'normal' | 'copilot', text: string, filterResult?: 'RELEVANT' | 'SKIP' | 'ERROR') {
   const now = new Date();
@@ -39,6 +41,55 @@ function logTranscript(mode: 'normal' | 'copilot', text: string, filterResult?: 
 
   try { appendFileSync(filePath, line); } catch (e: any) {
     console.error(`[Transcript] Write error: ${e.message}`);
+  }
+}
+
+// ─── Timing Profiler ───
+
+let traceCounter = 0;
+
+interface TimingTrace {
+  id: string;
+  mode: 'normal' | 'copilot';
+  text: string;
+  steps: { label: string; ts: number }[];
+  filterResult?: string;
+}
+
+function createTrace(mode: 'normal' | 'copilot', text: string): TimingTrace {
+  return {
+    id: `T${++traceCounter}`,
+    mode,
+    text: text.substring(0, 80),
+    steps: [{ label: 'created', ts: Date.now() }],
+  };
+}
+
+function traceStep(trace: TimingTrace, label: string) {
+  trace.steps.push({ label, ts: Date.now() });
+}
+
+function traceFinish(trace: TimingTrace) {
+  traceStep(trace, 'done');
+  const start = trace.steps[0].ts;
+  const totalMs = Date.now() - start;
+
+  // Build timing breakdown
+  const parts: string[] = [];
+  for (let i = 1; i < trace.steps.length; i++) {
+    const delta = trace.steps[i].ts - trace.steps[i - 1].ts;
+    parts.push(`${trace.steps[i].label}=${delta}ms`);
+  }
+
+  const line = `[${new Date().toISOString().slice(11, 19)}] ${trace.id} ${trace.mode} total=${totalMs}ms | ${parts.join(' | ')}${trace.filterResult ? ` | filter=${trace.filterResult}` : ''} | "${trace.text}"\n`;
+
+  console.log(`[Timing] ${trace.id} ${trace.mode} total=${totalMs}ms — ${parts.join(', ')}`);
+
+  // Write to daily timing log
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const filePath = join(TIMING_DIR, `${dateStr}.log`);
+  try { appendFileSync(filePath, line); } catch (e: any) {
+    console.error(`[Timing] Write error: ${e.message}`);
   }
 }
 
@@ -798,9 +849,15 @@ class G1OpenClawBridge extends AppServer {
       const batch = copilotBuffer.join(' ');
       copilotBuffer = [];
 
+      const trace = createTrace('copilot', batch);
+      traceStep(trace, 'debounce_done');
+
       // ─── LLM Pre-Filter ───
       console.log(`[${sessionId}] Copilot filter (${batchItemCount} items, pipeline=${copilotPipelineSize}): "${batch.substring(0, 80)}"`);
+      traceStep(trace, 'filter_start');
       const filterResult = await filterWithLLM(batch);
+      traceStep(trace, 'filter_done');
+      trace.filterResult = filterResult;
       logTranscript('copilot', batch, filterResult);
 
       // Always add to context window (even SKIPs — they're valuable conversation context)
@@ -811,6 +868,7 @@ class G1OpenClawBridge extends AppServer {
         copilotPipelineSize = Math.max(0, copilotPipelineSize - batchItemCount);
         copilotFilteredCount += batchItemCount;
         console.log(`[${sessionId}] Copilot: filtered out (SKIP) — pipeline=${copilotPipelineSize} filtered=${copilotFilteredCount}`);
+        traceFinish(trace);
         drainBuffer();  // Process any buffered items that arrived during filter call
         return;
       }
@@ -839,29 +897,37 @@ class G1OpenClawBridge extends AppServer {
           console.log(`[${sessionId}] Copilot: safety timeout (${COPILOT_TIMEOUT_MS / 1000}s)`);
           copilotPipelineSize = Math.max(0, copilotPipelineSize - batchItemCount);
           copilotInflight = false;
+          traceStep(trace, 'safety_timeout');
+          traceFinish(trace);
           openclawClient.cancelPendingRuns();
           drainBuffer();
         }
       }, COPILOT_TIMEOUT_MS);
 
+      traceStep(trace, 'opus_start');
       try {
         const reply = await openclawClient.chat(messageForOpus, G1_COPILOT_PREFIX);
         clearTimeout(safetyTimer);
+        traceStep(trace, 'opus_done');
         copilotPipelineSize = Math.max(0, copilotPipelineSize - batchItemCount);
         const t = reply ? reply.trim() : '';
         const skip = !t || /^NO[_]?R?E?P?L?Y?$/i.test(t) || t.startsWith('NO_REPLY') || t.startsWith('NO_RE');
         if (t && !skip) {
           console.log(`[${sessionId}] Copilot hint (pipeline=${copilotPipelineSize}): "${t.substring(0, 80)}"`);
+          traceStep(trace, 'display');
           display.showReply(t);
         } else {
           console.log(`[${sessionId}] Copilot: nothing to show (pipeline=${copilotPipelineSize})`);
+          traceStep(trace, 'no_reply');
         }
       } catch (e: any) {
         clearTimeout(safetyTimer);
+        traceStep(trace, 'opus_error');
         copilotPipelineSize = Math.max(0, copilotPipelineSize - batchItemCount);
         console.error(`[${sessionId}] Copilot error: ${e.message}`);
       } finally {
         copilotInflight = false;
+        traceFinish(trace);
         drainBuffer();
       }
     };
@@ -939,24 +1005,30 @@ class G1OpenClawBridge extends AppServer {
       }
 
       // Normal mode — log and send directly to Opus (no filter)
+      const normalTrace = createTrace('normal', userText);
       logTranscript('normal', userText);
       console.log(`[${sessionId}] User: "${userText}"`);
       display.showThinking(userText);
 
+      traceStep(normalTrace, 'opus_start');
       const reply = await openclawClient.chat(
         userText, G1_PREFIX,
         () => display.showWaiting()
       );
+      traceStep(normalTrace, 'opus_done');
 
       const trimmed = reply ? reply.trim() : '';
       const isNoReply = !trimmed || /^NO[_]?R?E?P?L?Y?$/i.test(trimmed) || trimmed.startsWith('NO_REPLY') || trimmed.startsWith('NO_RE');
       if (trimmed && !isNoReply) {
         console.log(`[${sessionId}] Hex: "${reply.substring(0, 80)}"`);
+        traceStep(normalTrace, 'display');
         display.showReply(reply);
       } else {
         console.log(`[${sessionId}] Hex: silent (NO_REPLY)`);
+        traceStep(normalTrace, 'no_reply');
         display.showStatus('', 100); // Clear the "Thinking..." display
       }
+      traceFinish(normalTrace);
     };
 
     // ─── Transcription Subscribe with auto-resubscribe on error ───
