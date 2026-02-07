@@ -49,6 +49,15 @@ const MAX_RECONNECT_DELAY_MS = 60_000;
 const HEAD_HOLD_MS = 5_000;
 const NOTIF_DEDUP_WINDOW_MS = 10_000;
 
+// ─── Helpers ───
+
+function formatAgo(sec: number): string {
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h`;
+  return `${Math.floor(sec / 86400)}d`;
+}
+
 // ─── OpenClaw Gateway WebSocket Client (with auto-reconnect) ───
 
 class OpenClawClient {
@@ -609,7 +618,7 @@ function startPushServer() {
           listening: s.listening,
           copilot: s.copilot,
           lastTranscriptAt: s.lastTranscriptAt,
-          lastTranscriptAgo: agoSec !== null ? `${agoSec}s ago` : null,
+          lastTranscriptAgo: agoSec !== null ? formatAgo(agoSec) : null,
           lastTranscriptText: s.lastTranscriptText || null,
           copilotQueueSize: s.copilotQueueSize,
           copilotInflight: s.copilotInflight,
