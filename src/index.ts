@@ -83,7 +83,7 @@ class OpenClawClient {
           type: 'req', id: connId, method: 'connect',
           params: {
             minProtocol: 3, maxProtocol: 3,
-            client: { id: 'gateway-client', displayName: 'G1 Bridge', version: '0.8.0', platform: 'linux', mode: 'cli' },
+            client: { id: 'gateway-client', displayName: 'G1 Bridge', version: '0.8.1', platform: 'linux', mode: 'cli' },
             auth: { token: OPENCLAW_GW_TOKEN },
           },
         });
@@ -121,6 +121,7 @@ class OpenClawClient {
             let text = '';
             if (Array.isArray(content)) text = content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('');
             else if (typeof content === 'string') text = content;
+            console.log(`[OpenClaw] chat final: runId=${pl.runId} text="${(text||'').substring(0,60)}" hasListener=${pl.runId ? this.runListeners.has(pl.runId) : 'no-runId'} pendingCbs=${this._pendingRunCallbacks.length} listeners=${this.runListeners.size}`);
             if (text && pl.runId) {
               const cb = this.runListeners.get(pl.runId);
               if (cb) { this.runListeners.delete(pl.runId); cb(text); }
@@ -130,9 +131,26 @@ class OpenClawClient {
 
         if (msg.type === 'event' && msg.event === 'agent') {
           const pl = msg.payload;
+          if (pl?.stream === 'lifecycle') {
+            console.log(`[OpenClaw] agent lifecycle: phase=${pl?.data?.phase} runId=${pl?.runId} pendingCbs=${this._pendingRunCallbacks.length}`);
+          }
           if (pl?.stream === 'lifecycle' && pl?.data?.phase === 'start' && pl?.runId && this._pendingRunCallbacks.length > 0) {
             const cb = this._pendingRunCallbacks.shift()!;
             this.runListeners.set(pl.runId, cb);
+            console.log(`[OpenClaw] matched runId=${pl.runId} → listener (remaining pendingCbs=${this._pendingRunCallbacks.length})`);
+          }
+          // If run ended but we never got a chat event, resolve with empty (NO_REPLY)
+          if (pl?.stream === 'lifecycle' && pl?.data?.phase === 'end' && pl?.runId && this.runListeners.has(pl.runId)) {
+            // Give chat event 2s to arrive (it sometimes comes slightly after phase:end)
+            const endRunId = pl.runId;
+            setTimeout(() => {
+              const cb = this.runListeners.get(endRunId);
+              if (cb) {
+                console.log(`[OpenClaw] phase:end cleanup — no chat event for runId=${endRunId}, resolving as empty`);
+                this.runListeners.delete(endRunId);
+                cb('');
+              }
+            }, 2000);
           }
         }
       });
@@ -444,13 +462,21 @@ class NotificationDedup {
   }
 }
 
-// Active sessions for push + mic control
+// Active sessions for push + mic control + debug status
 type SessionHandle = {
   display: DisplayManager;
   toggleMic: () => void;
   getMicState: () => boolean;
   toggleCopilot: () => boolean;  // returns new state
   getCopilotState: () => boolean;
+  getDebugStatus: () => {
+    lastTranscriptAt: number | null;
+    lastTranscriptText: string;
+    copilotQueueSize: number;
+    copilotInflight: boolean;
+    listening: boolean;
+    copilot: boolean;
+  };
 };
 const activeSessions = new Map<string, SessionHandle>();
 
@@ -566,6 +592,40 @@ function startPushServer() {
       return;
     }
 
+    if (req.method === 'GET' && path === '/debug') {
+      // Debug endpoint: per-session transcript & queue status
+      const sessions: Record<string, any> = {};
+      for (const [id, h] of activeSessions) {
+        const s = h.getDebugStatus();
+        const agoSec = s.lastTranscriptAt ? Math.round((Date.now() - s.lastTranscriptAt) / 1000) : null;
+
+        // Progress: queue fill (each item = 20%, caps at 100)
+        // Inflight counts as 1 item too
+        let progress = 0;
+        if (s.copilotInflight) progress = Math.min((1 + s.copilotQueueSize) * 20, 100);
+        else if (s.copilotQueueSize > 0) progress = Math.min(s.copilotQueueSize * 20, 100);
+
+        sessions[id] = {
+          listening: s.listening,
+          copilot: s.copilot,
+          lastTranscriptAt: s.lastTranscriptAt,
+          lastTranscriptAgo: agoSec !== null ? `${agoSec}s ago` : null,
+          lastTranscriptText: s.lastTranscriptText || null,
+          copilotQueueSize: s.copilotQueueSize,
+          copilotInflight: s.copilotInflight,
+          progress,
+        };
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        openclaw: openclawClient.isConnected(),
+        totalSessions: activeSessions.size,
+        sessions,
+      }));
+      return;
+    }
+
     res.writeHead(404); res.end('Not found');
   });
   server.listen(PUSH_PORT, PUSH_BIND, () => console.log(`[Push] API on http://${PUSH_BIND}:${PUSH_PORT}${PUSH_TOKEN ? ' (auth required)' : ''}`));
@@ -594,14 +654,15 @@ class G1OpenClawBridge extends AppServer {
     const COPILOT_DEBOUNCE_MS = 3_000;  // Batch transcripts over 3s window
     let unsubTranscription: (() => void) | null = null;
     let resubAttempts = 0;
+    let lastTranscriptAt: number | null = null;
+    let lastTranscriptText = '';
+
+    const COPILOT_TIMEOUT_MS = 60_000;  // 60s max for copilot responses
 
     // Copilot batch processor — serializes requests, never drops buffered text
     const sendCopilotBatch = async () => {
       if (copilotBuffer.length === 0) return;
       if (copilotInflight) {
-        // Previous request still running (maybe doing research).
-        // Don't cancel it — just schedule a retry after it finishes.
-        // The buffer keeps accumulating; we'll send when it's our turn.
         console.log(`[${sessionId}] Copilot: deferring batch (in-flight request)`);
         return;
       }
@@ -610,8 +671,20 @@ class G1OpenClawBridge extends AppServer {
       copilotBuffer = [];
 
       copilotInflight = true;
+
+      // Safety timeout — if chat() never resolves, force-unlock after 60s
+      const safetyTimer = setTimeout(() => {
+        if (copilotInflight) {
+          console.log(`[${sessionId}] Copilot: safety timeout (${COPILOT_TIMEOUT_MS / 1000}s)`);
+          copilotInflight = false;
+          openclawClient.cancelPendingRuns();
+          drainBuffer();
+        }
+      }, COPILOT_TIMEOUT_MS);
+
       try {
         const reply = await openclawClient.chat(batch, G1_COPILOT_PREFIX);
+        clearTimeout(safetyTimer);
         const t = reply ? reply.trim() : '';
         const skip = !t || /^NO[_]?R?E?P?L?Y?$/i.test(t) || t.startsWith('NO_REPLY') || t.startsWith('NO_RE');
         if (t && !skip) {
@@ -621,19 +694,22 @@ class G1OpenClawBridge extends AppServer {
           console.log(`[${sessionId}] Copilot: nothing to show`);
         }
       } catch (e: any) {
+        clearTimeout(safetyTimer);
         console.error(`[${sessionId}] Copilot error: ${e.message}`);
       } finally {
         copilotInflight = false;
-        // If more transcripts accumulated while we were busy, process them
-        if (copilotBuffer.length > 0 && copilotMode) {
-          console.log(`[${sessionId}] Copilot: draining ${copilotBuffer.length} buffered items`);
-          // Small delay to let any final debounce settle
-          if (copilotDebounceTimer) clearTimeout(copilotDebounceTimer);
-          copilotDebounceTimer = setTimeout(() => {
-            copilotDebounceTimer = null;
-            sendCopilotBatch();
-          }, 1_000);
-        }
+        drainBuffer();
+      }
+    };
+
+    const drainBuffer = () => {
+      if (copilotBuffer.length > 0 && copilotMode) {
+        console.log(`[${sessionId}] Copilot: draining ${copilotBuffer.length} buffered items`);
+        if (copilotDebounceTimer) clearTimeout(copilotDebounceTimer);
+        copilotDebounceTimer = setTimeout(() => {
+          copilotDebounceTimer = null;
+          sendCopilotBatch();
+        }, 1_000);
       }
     };
     let resubTimer: ReturnType<typeof setTimeout> | null = null;
@@ -645,6 +721,10 @@ class G1OpenClawBridge extends AppServer {
       if (!data.isFinal) return;
       const userText = data.text.trim();
       if (!userText) return;
+
+      // Track for debug status
+      lastTranscriptAt = Date.now();
+      lastTranscriptText = userText;
 
       const lower = userText.toLowerCase();
 
@@ -802,6 +882,14 @@ class G1OpenClawBridge extends AppServer {
         return copilotMode;
       },
       getCopilotState: () => copilotMode,
+      getDebugStatus: () => ({
+        lastTranscriptAt,
+        lastTranscriptText,
+        copilotQueueSize: copilotBuffer.length,
+        copilotInflight,
+        listening,
+        copilot: copilotMode,
+      }),
     });
 
     // ─── Phone Notifications (with dedup + blocklist + queue) ───
@@ -877,7 +965,7 @@ class G1OpenClawBridge extends AppServer {
 // ─── Main ───
 
 async function main() {
-  console.log('G1-OpenClaw Bridge v0.8.0');
+  console.log('G1-OpenClaw Bridge v0.8.1');
   console.log(`  MentraOS: ${PACKAGE_NAME}`);
   console.log(`  OpenClaw: ${OPENCLAW_WS_URL}`);
   console.log(`  Ports: ${PORT} (MentraOS), ${PUSH_PORT} (Push API)`);
