@@ -879,7 +879,7 @@ class G1OpenClawBridge extends AppServer {
         console.log(`[${sessionId}] Copilot: "${ASSISTANT_NAME}" detected — skipping filter (${batchItemCount} items, pipeline=${copilotPipelineSize}): "${batch.substring(0, 80)}"`);
         traceStep(trace, 'keyword_bypass');
         filterResult = 'RELEVANT';
-        logTranscript('copilot', batch, filterResult);
+        logTranscript('copilot', batch, 'BYPASS' as any);
       } else {
         // ─── LLM Pre-Filter ───
         console.log(`[${sessionId}] Copilot filter (${batchItemCount} items, pipeline=${copilotPipelineSize}): "${batch.substring(0, 80)}"`);
