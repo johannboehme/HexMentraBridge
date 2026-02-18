@@ -324,8 +324,18 @@ cp .env.example .env
 Then edit `.env`:
 - `PACKAGE_NAME` and `MENTRAOS_API_KEY` — your human gets these from their MentraOS Developer Console
 - `OPENCLAW_WS_URL` — point to your Gateway WebSocket (usually `ws://localhost:18789` if on the same machine)
-- `OPENCLAW_GW_TOKEN` — your Gateway token (check your OpenClaw config)
+- `OPENCLAW_GW_TOKEN` — your Gateway master token (check your OpenClaw config)
 - `FILTER_LLM_URL`, `FILTER_LLM_API_KEY`, `FILTER_LLM_MODEL` — *(optional)* for copilot pre-filtering
+
+Then run the one-time device pairing setup:
+
+```bash
+bun scripts/setup-device-auth.ts
+```
+
+This generates an Ed25519 keypair, saves it to `.device-auth.json`, and pairs the bridge with your Gateway so it gets `operator.read` + `operator.write` scopes. Without this step, `chat.send` will fail with `missing scope: operator.write` — the Gateway strips all scopes from clients without a verified device identity.
+
+> **Note:** `.device-auth.json` contains your private key. It is already in `.gitignore`. Never commit it.
 
 ### How messages arrive
 
@@ -388,6 +398,11 @@ Use push for calendar reminders, urgent notifications, weather alerts, or anythi
 - In copilot mode, you get conversation context with each RELEVANT transcript — use it!
 
 ## Changelog
+
+### v0.9.1
+- **Device Auth (required)** — Bridge now performs proper Ed25519 device pairing with the OpenClaw Gateway. This grants `operator.read` + `operator.write` scopes so `chat.send` works correctly. Run `bun scripts/setup-device-auth.ts` once after install.
+- **`scripts/setup-device-auth.ts`** — One-shot pairing script: generates keypair, connects to Gateway, saves device token to `.device-auth.json`.
+- **Bug fix:** Previously, the bridge connected successfully but all `chat.send` calls failed with `missing scope: operator.write` because the Gateway strips scopes from clients without a verified device identity (even if the master token matches).
 
 ### v0.9.0
 - **LLM Pre-Filter for Copilot Mode** — Configurable cheap LLM (e.g. Claude Haiku) filters copilot transcripts before they reach the main AI. Typically saves 85-95% of API calls.

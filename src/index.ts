@@ -1,8 +1,9 @@
 import { AppServer, AppSession } from '@mentra/sdk';
 import { WebSocket } from 'ws';
 import { createServer, IncomingMessage, ServerResponse } from 'http';
-import { mkdirSync, appendFileSync } from 'fs';
+import { mkdirSync, appendFileSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { createPrivateKey, sign as cryptoSign } from 'crypto';
 
 const PACKAGE_NAME = process.env.PACKAGE_NAME ?? (() => { throw new Error('PACKAGE_NAME not set'); })();
 const MENTRAOS_API_KEY = process.env.MENTRAOS_API_KEY ?? (() => { throw new Error('MENTRAOS_API_KEY not set'); })();
@@ -12,6 +13,25 @@ const PUSH_BIND = process.env.PUSH_BIND || '127.0.0.1';
 const PUSH_TOKEN = process.env.PUSH_TOKEN || '';  // Optional auth token for external access
 const OPENCLAW_WS_URL = process.env.OPENCLAW_WS_URL || 'ws://localhost:18789';
 const OPENCLAW_GW_TOKEN = process.env.OPENCLAW_GW_TOKEN || '';
+
+// Device auth (keypair + token for operator.read/write scopes)
+const DEVICE_AUTH_PATH = join(import.meta.dir, '../.device-auth.json');
+const deviceAuth: { deviceId: string; publicKeyBase64url: string; privateKeyPkcs8Base64: string; deviceToken?: string } | null =
+  existsSync(DEVICE_AUTH_PATH) ? JSON.parse(readFileSync(DEVICE_AUTH_PATH, 'utf8')) : null;
+
+function buildDeviceAuthPayload(params: {
+  deviceId: string; clientId: string; clientMode: string;
+  role: string; scopes: string[]; signedAtMs: number; token: string;
+}): string {
+  return ['v1', params.deviceId, params.clientId, params.clientMode, params.role, params.scopes.join(','), String(params.signedAtMs), params.token].join('|');
+}
+
+function signDevicePayload(payload: string): string {
+  if (!deviceAuth) throw new Error('No device auth');
+  const privDer = Buffer.from(deviceAuth.privateKeyPkcs8Base64, 'base64');
+  const privateKey = createPrivateKey({ key: privDer, format: 'der', type: 'pkcs8' });
+  return cryptoSign(null, Buffer.from(payload), privateKey).toString('base64url');
+}
 
 // Copilot LLM Filter (e.g. Azure-hosted Haiku)
 const FILTER_LLM_URL = process.env.FILTER_LLM_URL || '';
@@ -264,7 +284,19 @@ class OpenClawClient {
           params: {
             minProtocol: 3, maxProtocol: 3,
             client: { id: 'gateway-client', displayName: 'G1 Bridge', version: '0.9.0', platform: 'linux', mode: 'cli' },
-            auth: { token: OPENCLAW_GW_TOKEN },
+            role: 'operator',
+            scopes: ['operator.read', 'operator.write'],
+            auth: { token: deviceAuth?.deviceToken || OPENCLAW_GW_TOKEN },
+            ...(deviceAuth ? (() => {
+              const signedAt = Date.now();
+              const payload = buildDeviceAuthPayload({
+                deviceId: deviceAuth.deviceId,
+                clientId: 'gateway-client', clientMode: 'cli',
+                role: 'operator', scopes: ['operator.read', 'operator.write'],
+                signedAtMs: signedAt, token: deviceAuth.deviceToken || OPENCLAW_GW_TOKEN,
+              });
+              return { device: { id: deviceAuth.deviceId, publicKey: deviceAuth.publicKeyBase64url, signature: signDevicePayload(payload), signedAt } };
+            })() : {}),
           },
         });
         const handler = (data: any) => {
