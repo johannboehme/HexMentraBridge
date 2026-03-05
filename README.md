@@ -9,6 +9,7 @@ You wear the glasses. You say something. Your AI assistant hears it, thinks abou
 **Features:**
 
 - 🎙️ **Voice → AI → Display** — Speak naturally, get answers on your HUD
+- 📲 **G1Claw App Support** — Direct WebSocket connection from the [G1Claw](https://github.com/johannboehme/g1app) Android app (no MentraOS required)
 - 🔄 **Copilot Mode** — AI listens silently to your conversations and only chimes in with useful context (facts, corrections, suggestions)
 - 🧠 **LLM Pre-Filter** — Cheap model (Claude Haiku) filters copilot transcripts before they reach your main AI — saves ~85-95% of API costs
 - 📝 **Transcript Logging** — All conversations logged for later summarization and recall
@@ -21,13 +22,25 @@ You wear the glasses. You say something. Your AI assistant hears it, thinks abou
 
 ## How it works
 
+The bridge supports two connection methods to the G1 glasses:
+
+**Via MentraOS (original):**
 ```
 You speak → G1 Mic → MentraOS Cloud (speech-to-text)
   → This Bridge → OpenClaw Gateway (your AI agent)
-  → Reply via WebSocket → Bridge → G1 HUD Display
+  → Reply via WebSocket → Bridge → MentraOS → G1 HUD Display
 ```
 
-In **Copilot Mode**, there's an extra filtering step:
+**Via G1Claw App (new — better battery, no cloud middleman):**
+```
+You speak → G1 Mic → G1Claw App (BLE, on-device STT)
+  → This Bridge (WebSocket /app-ws) → OpenClaw Gateway
+  → Reply via WebSocket → Bridge → G1Claw App → G1 HUD Display
+```
+
+Both methods can run simultaneously. MentraOS is optional — if `PACKAGE_NAME` is not set, only the G1Claw WebSocket endpoint starts.
+
+In **Copilot Mode**, there's an extra filtering step (works with both connection methods):
 
 ```
 Transcript → Bridge → Log file (always)
@@ -36,15 +49,16 @@ Transcript → Bridge → Log file (always)
                          └── RELEVANT → OpenClaw (Opus/Sonnet) with conversation context
 ```
 
-The bridge runs on a server (a VPS, a Raspberry Pi, your laptop — anything with Node/Bun). It talks to MentraOS (Even Realities' cloud platform) for speech-to-text and display control, and to OpenClaw's Gateway WebSocket for AI chat.
+The bridge runs on a server (a VPS, a Raspberry Pi, your laptop — anything with Node/Bun). It talks to MentraOS (Even Realities' cloud platform) for speech-to-text and display control, and/or to the G1Claw Android app via WebSocket. It connects to OpenClaw's Gateway WebSocket for AI chat.
 
 ## Requirements
 
 - [Even Realities G1](https://www.evenrealities.com/) smart glasses
-- [MentraOS Developer Account](https://developer.mentra.glass/) with an app + API key
 - [OpenClaw](https://openclaw.ai) instance running with Gateway WebSocket enabled
 - [Bun](https://bun.sh/) runtime (v1.0+)
-- A server reachable from the internet (MentraOS sends webhooks to your bridge)
+- **One of:**
+  - [G1Claw App](https://github.com/johannboehme/g1app) on an Android phone (recommended — no cloud dependency, better battery)
+  - [MentraOS Developer Account](https://developer.mentra.glass/) with an app + API key + a server reachable from the internet
 - *(Optional)* An API endpoint for the copilot LLM filter (e.g. Claude Haiku via Azure, Anthropic, or any OpenAI-compatible API)
 
 ## Setup
@@ -67,14 +81,14 @@ Edit `.env` with your credentials:
 
 | Variable | What it is |
 |----------|------------|
-| `PACKAGE_NAME` | Your MentraOS app package name (from Developer Console) |
-| `MENTRAOS_API_KEY` | Your MentraOS API key (from Developer Console) |
+| `PACKAGE_NAME` | *(Optional)* Your MentraOS app package name — omit to run without MentraOS |
+| `MENTRAOS_API_KEY` | *(Optional)* Your MentraOS API key — required only if `PACKAGE_NAME` is set |
 | `OPENCLAW_WS_URL` | WebSocket URL of your OpenClaw Gateway (default: `ws://localhost:18789`) |
 | `OPENCLAW_GW_TOKEN` | Your OpenClaw Gateway token |
-| `PORT` | Port for MentraOS webhooks (default: 3000) |
-| `PUSH_PORT` | Port for the Push API (default: 3001) |
-| `PUSH_BIND` | Bind address for Push API — `127.0.0.1` for local only, `0.0.0.0` for external (default: `127.0.0.1`) |
-| `PUSH_TOKEN` | Auth token for Push API when exposed externally (generate with `openssl rand -hex 24`) |
+| `PORT` | Port for MentraOS webhooks (default: 3000) — only used if MentraOS is enabled |
+| `PUSH_PORT` | Port for Push API + G1Claw App WebSocket (default: 3001) |
+| `PUSH_BIND` | Bind address — `127.0.0.1` for local only, `0.0.0.0` for external (default: `127.0.0.1`) |
+| `PUSH_TOKEN` | Auth token for Push API and App WebSocket when exposed externally (generate with `openssl rand -hex 24`) |
 | `NOTIF_BLOCKLIST` | Comma-separated app names to suppress (e.g. `System UI,Google Play Store`) |
 | `FILTER_LLM_URL` | *(Optional)* API endpoint for copilot pre-filter LLM (e.g. Azure Anthropic Messages endpoint) |
 | `FILTER_LLM_API_KEY` | *(Optional)* API key for the filter LLM |
@@ -102,6 +116,10 @@ bun run start
 
 ### 5. Connect your glasses
 
+**Option A — G1Claw App (recommended):**
+Install the [G1Claw app](https://github.com/johannboehme/g1app) on your Android phone. In Settings, set the WebSocket URL to `ws://<your-vps>:3001/app-ws` and the auth token to your `PUSH_TOKEN`. Connect to your G1 glasses via BLE, then use Push-to-Talk or Always-On mode.
+
+**Option B — MentraOS:**
 Open the MentraOS app on your phone → start your app → the glasses should show "Hex connected." (or your agent's name). Look up for 5 seconds to start listening.
 
 ## Usage
@@ -228,6 +246,60 @@ Pipeline fields:
 
 If `PUSH_TOKEN` is set, add `Authorization: Bearer <token>` header or `?token=<token>` query param.
 
+### G1Claw App WebSocket (`/app-ws`)
+
+The G1Claw Android app connects via WebSocket for bidirectional communication. This replaces MentraOS for G1Claw users.
+
+**Endpoint:** `ws://<your-vps>:3001/app-ws`
+
+**Authentication:** If `PUSH_TOKEN` is set, the app must provide it via:
+- `Authorization: Bearer <token>` header on the WebSocket upgrade request, or
+- `?token=<token>` query parameter
+
+**Messages from App to Bridge:**
+
+```json
+// Transcribed text (from on-device or VPS STT)
+{"type": "transcription", "text": "How's the weather?"}
+
+// Toggle copilot mode
+{"type": "set_mode", "copilot": true}
+
+// Raw audio for server-side STT (future — not yet implemented)
+{"type": "audio", "data": "<base64-encoded-pcm>"}
+
+// Keepalive
+{"type": "ping"}
+```
+
+**Messages from Bridge to App:**
+
+```json
+// AI response (display on glasses)
+{"type": "ai_response", "text": "Sunny, 22 degrees."}
+
+// Keepalive response
+{"type": "pong"}
+```
+
+**Behavior:**
+- Transcriptions are routed through the same OpenClaw pipeline as MentraOS (same prefixes, same copilot logic)
+- Voice commands work the same: "new session"/"neue session" resets the AI, "copilot mode/on/off/an/aus" toggles copilot
+- Copilot mode applies the same LLM pre-filter and debounce batching
+- Push API messages (`/push`) are also forwarded to connected app clients
+- Multiple app clients can connect simultaneously (each gets its own copilot state)
+- The app handles all BLE communication and display rendering — the bridge just routes text
+
+**Example (wscat):**
+```bash
+# Connect
+wscat -c "ws://your-vps:3001/app-ws?token=YOUR_TOKEN"
+
+# Send a transcription
+> {"type":"transcription","text":"What time is it in Tokyo?"}
+< {"type":"ai_response","text":"It's currently 3:42 AM in Tokyo (JST, UTC+9)."}
+```
+
 ### Bitmap text helper
 
 Generate and push text as a monochrome bitmap (pixel font):
@@ -249,23 +321,21 @@ The G1 has a monochrome (green-on-black) display, roughly 640×200 pixels with ~
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────────────────────┐
-│  G1 Glasses │────▶│ MentraOS     │────▶│  This Bridge (Bun/Node)     │
-│  (mic/hud)  │◀────│ Cloud (STT)  │◀────│                             │
-└─────────────┘     └──────────────┘     │  ┌─────────────────────┐   │
-                                         │  │ Transcript Logger   │   │
-                                         │  │ (transcripts/*.md)  │   │
-                                         │  └─────────────────────┘   │
+                                         ┌─────────────────────────────┐
+┌─────────────┐     ┌──────────────┐     │  This Bridge (Bun/Node)     │
+│  G1 Glasses │────▶│ MentraOS     │────▶│                             │
+│  (mic/hud)  │◀────│ Cloud (STT)  │◀────│  Port 3000 (MentraOS)      │
+└──────┬──────┘     └──────────────┘     │  (optional)                 │
+       │ BLE                             │                             │
+┌──────▼──────┐                          │  ┌─────────────────────┐   │
+│  G1Claw App │◀────── WebSocket ───────▶│  │ Port 3001           │   │
+│  (Android)  │      /app-ws :3001       │  │ Push API + App WS   │◀─── Tasker/WearOS
+└─────────────┘                          │  └─────────────────────┘   │
                                          │                             │
                                          │  ┌─────────────────────┐   │
-                                         │  │ LLM Pre-Filter      │   │
-                                         │  │ (Haiku, copilot     │   │
-                                         │  │  mode only)         │   │
+                                         │  │ Transcript Logger   │   │
+                                         │  │ + LLM Pre-Filter    │   │
                                          │  └──────────┬──────────┘   │
-                                         │             │ RELEVANT     │
-                                         │  ┌──────────▼──────────┐   │
-                                         │  │ Push API (:3001)    │◀─── Tasker/WearOS
-                                         │  └─────────────────────┘   │
                                          └────────────┬───────────────┘
                                                       │ WebSocket
                                          ┌────────────▼───────────────┐
@@ -322,9 +392,12 @@ cp .env.example .env
 ```
 
 Then edit `.env`:
-- `PACKAGE_NAME` and `MENTRAOS_API_KEY` — your human gets these from their MentraOS Developer Console
 - `OPENCLAW_WS_URL` — point to your Gateway WebSocket (usually `ws://localhost:18789` if on the same machine)
 - `OPENCLAW_GW_TOKEN` — your Gateway master token (check your OpenClaw config)
+- `PUSH_PORT` — port for Push API + G1Claw WebSocket (default: 3001)
+- `PUSH_BIND` — set to `0.0.0.0` if the G1Claw app connects from a phone (not localhost)
+- `PUSH_TOKEN` — auth token for Push API and G1Claw WebSocket (generate with `openssl rand -hex 24`)
+- `PACKAGE_NAME` and `MENTRAOS_API_KEY` — *(optional)* your human gets these from their MentraOS Developer Console (not needed if using G1Claw app)
 - `FILTER_LLM_URL`, `FILTER_LLM_API_KEY`, `FILTER_LLM_MODEL` — *(optional)* for copilot pre-filtering
 
 Then run the one-time device pairing setup:
@@ -398,6 +471,12 @@ Use push for calendar reminders, urgent notifications, weather alerts, or anythi
 - In copilot mode, you get conversation context with each RELEVANT transcript — use it!
 
 ## Changelog
+
+### v0.10.0
+- **G1Claw App WebSocket** — New `/app-ws` WebSocket endpoint on port 3001 for direct communication with the [G1Claw](https://github.com/johannboehme/g1app) Android app. Receives transcriptions, sends AI responses back. Full copilot mode support (same filter/debounce pipeline as MentraOS sessions).
+- **MentraOS now optional** — `PACKAGE_NAME` and `MENTRAOS_API_KEY` are no longer required. Omit them to run in G1Claw-only mode. Both MentraOS and G1Claw can run simultaneously.
+- **Push API extended** — `/push` messages are now also forwarded to connected G1Claw app clients via WebSocket.
+- **Status/Debug extended** — `/status` and `/debug` endpoints now include connected G1Claw app client information.
 
 ### v0.9.1
 - **Device Auth (required)** — Bridge now performs proper Ed25519 device pairing with the OpenClaw Gateway. This grants `operator.read` + `operator.write` scopes so `chat.send` works correctly. Run `bun scripts/setup-device-auth.ts` once after install.

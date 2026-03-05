@@ -1,12 +1,12 @@
 import { AppServer, AppSession } from '@mentra/sdk';
-import { WebSocket } from 'ws';
+import { WebSocket, WebSocketServer } from 'ws';
 import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { mkdirSync, appendFileSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { createPrivateKey, sign as cryptoSign } from 'crypto';
 
-const PACKAGE_NAME = process.env.PACKAGE_NAME ?? (() => { throw new Error('PACKAGE_NAME not set'); })();
-const MENTRAOS_API_KEY = process.env.MENTRAOS_API_KEY ?? (() => { throw new Error('MENTRAOS_API_KEY not set'); })();
+const PACKAGE_NAME = process.env.PACKAGE_NAME || '';
+const MENTRAOS_API_KEY = process.env.MENTRAOS_API_KEY || '';
 const PORT = parseInt(process.env.PORT || '3000');
 const PUSH_PORT = parseInt(process.env.PUSH_PORT || '3001');
 const PUSH_BIND = process.env.PUSH_BIND || '127.0.0.1';
@@ -753,6 +753,40 @@ type SessionHandle = {
 };
 const activeSessions = new Map<string, SessionHandle>();
 
+// ─── G1Claw App WebSocket Clients ───
+
+interface AppClientState {
+  ws: WebSocket;
+  copilotMode: boolean;
+  copilotBuffer: string[];
+  copilotDebounceTimer: ReturnType<typeof setTimeout> | null;
+  copilotInflight: boolean;
+  copilotPipelineSize: number;
+  copilotFilteredCount: number;
+  copilotPassedCount: number;
+  copilotContextWindow: string[];
+  lastTranscriptAt: number | null;
+  lastTranscriptText: string;
+}
+
+const appClients = new Map<string, AppClientState>();
+let appClientCounter = 0;
+
+function sendToAppClient(client: AppClientState, msg: object) {
+  if (client.ws.readyState === WebSocket.OPEN) {
+    client.ws.send(JSON.stringify(msg));
+  }
+}
+
+function broadcastToAppClients(msg: object) {
+  const data = JSON.stringify(msg);
+  for (const [, client] of appClients) {
+    if (client.ws.readyState === WebSocket.OPEN) {
+      client.ws.send(data);
+    }
+  }
+}
+
 // ─── Push HTTP API ───
 
 function startPushServer() {
@@ -779,6 +813,7 @@ function startPushServer() {
           if (!text) { res.writeHead(400); res.end('{"error":"text required"}'); return; }
           let sent = 0;
           for (const [id, h] of activeSessions) { h.display.showNotification(text, duration); sent++; }
+          for (const [id, c] of appClients) { sendToAppClient(c, { type: 'ai_response', text }); sent++; }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, sessions: sent }));
         } catch (e) { res.writeHead(400); res.end('{"error":"invalid json"}'); }
@@ -828,11 +863,21 @@ function startPushServer() {
     }
 
     if (req.method === 'POST' && path === '/copilot') {
-      // Toggle copilot mode on all active sessions — for WearOS/Tasker trigger
+      // Toggle copilot mode on all active sessions + app clients
       let toggled = 0;
       let copilotState = false;
       for (const [id, h] of activeSessions) {
         copilotState = h.toggleCopilot();
+        toggled++;
+      }
+      for (const [id, c] of appClients) {
+        c.copilotMode = !c.copilotMode;
+        copilotState = c.copilotMode;
+        if (c.copilotDebounceTimer) { clearTimeout(c.copilotDebounceTimer); c.copilotDebounceTimer = null; }
+        c.copilotBuffer = [];
+        c.copilotPipelineSize = 0;
+        c.copilotContextWindow.length = 0;
+        sendToAppClient(c, { type: 'ai_response', text: copilotState ? 'Copilot ON' : 'Copilot OFF' });
         toggled++;
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -844,8 +889,9 @@ function startPushServer() {
       // Get copilot state
       let copilotState = false;
       for (const [id, h] of activeSessions) { copilotState = h.getCopilotState(); }
+      for (const [id, c] of appClients) { copilotState = c.copilotMode; }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, sessions: activeSessions.size, copilot: copilotState }));
+      res.end(JSON.stringify({ ok: true, sessions: activeSessions.size + appClients.size, copilot: copilotState }));
       return;
     }
 
@@ -853,12 +899,15 @@ function startPushServer() {
       let micState = false;
       let copilotState = false;
       for (const [id, h] of activeSessions) { micState = h.getMicState(); copilotState = h.getCopilotState(); }
+      for (const [id, c] of appClients) { copilotState = c.copilotMode; }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
         openclaw: openclawClient.isConnected(),
         sessions: activeSessions.size,
         sessionIds: [...activeSessions.keys()],
+        appClients: appClients.size,
+        appClientIds: [...appClients.keys()],
         listening: micState,
         copilot: copilotState,
       }));
@@ -893,19 +942,310 @@ function startPushServer() {
           progress,
         };
       }
+      // App client debug info
+      const appClientDebug: Record<string, any> = {};
+      for (const [id, c] of appClients) {
+        const agoSec = c.lastTranscriptAt ? Math.round((Date.now() - c.lastTranscriptAt) / 1000) : null;
+        const progress = Math.min(c.copilotPipelineSize * 20, 100);
+        appClientDebug[id] = {
+          type: 'g1claw',
+          copilot: c.copilotMode,
+          lastTranscriptAt: c.lastTranscriptAt,
+          lastTranscriptAgo: agoSec !== null ? formatAgo(agoSec) : null,
+          lastTranscriptText: c.lastTranscriptText || null,
+          copilotQueueSize: c.copilotPipelineSize,
+          copilotInflight: c.copilotInflight,
+          copilotPipeline: {
+            size: c.copilotPipelineSize,
+            bufferSize: c.copilotBuffer.length,
+            inflight: c.copilotInflight,
+            totalFiltered: c.copilotFilteredCount,
+            totalPassed: c.copilotPassedCount,
+          },
+          progress,
+        };
+      }
+
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
         openclaw: openclawClient.isConnected(),
         totalSessions: activeSessions.size,
+        totalAppClients: appClients.size,
         sessions,
+        appClients: appClientDebug,
       }));
       return;
     }
 
     res.writeHead(404); res.end('Not found');
   });
-  server.listen(PUSH_PORT, PUSH_BIND, () => console.log(`[Push] API on http://${PUSH_BIND}:${PUSH_PORT}${PUSH_TOKEN ? ' (auth required)' : ''}`));
+
+  // ─── G1Claw App WebSocket (upgrade on /app-ws) ───
+
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (request: IncomingMessage, socket: any, head: Buffer) => {
+    const url = new URL(request.url || '/', `http://localhost`);
+    if (url.pathname !== '/app-ws') {
+      socket.destroy();
+      return;
+    }
+
+    // Auth check (same token as push API)
+    if (PUSH_TOKEN) {
+      const auth = request.headers['authorization'] || '';
+      const urlToken = url.searchParams.get('token');
+      if (auth !== `Bearer ${PUSH_TOKEN}` && urlToken !== PUSH_TOKEN) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+    }
+
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  });
+
+  wss.on('connection', (ws: WebSocket) => {
+    const clientId = `app-${++appClientCounter}`;
+    console.log(`[${clientId}] G1Claw app connected`);
+
+    const client: AppClientState = {
+      ws,
+      copilotMode: false,
+      copilotBuffer: [],
+      copilotDebounceTimer: null,
+      copilotInflight: false,
+      copilotPipelineSize: 0,
+      copilotFilteredCount: 0,
+      copilotPassedCount: 0,
+      copilotContextWindow: [],
+      lastTranscriptAt: null,
+      lastTranscriptText: '',
+    };
+    appClients.set(clientId, client);
+
+    const COPILOT_DEBOUNCE_MS = 2_000;
+    const COPILOT_TIMEOUT_MS = 60_000;
+    const CONTEXT_WINDOW_SIZE = 5;
+
+    // ─── Copilot batch processor (same logic as MentraOS sessions) ───
+    const sendCopilotBatch = async () => {
+      if (client.copilotBuffer.length === 0) return;
+      if (client.copilotInflight) return;
+
+      const batchItemCount = client.copilotBuffer.length;
+      const batch = client.copilotBuffer.join(' ');
+      client.copilotBuffer = [];
+
+      const trace = createTrace('copilot', batch);
+      traceStep(trace, 'debounce_done');
+
+      const nameDetected = containsAssistantName(batch);
+      let filterResult: 'RELEVANT' | 'SKIP' | 'ERROR';
+
+      if (nameDetected) {
+        console.log(`[${clientId}] Copilot: "${ASSISTANT_NAME}" detected — skipping filter: "${batch.substring(0, 80)}"`);
+        traceStep(trace, 'keyword_bypass');
+        filterResult = 'RELEVANT';
+        logTranscript('copilot', batch, 'BYPASS' as any);
+      } else {
+        traceStep(trace, 'filter_start');
+        filterResult = await filterWithLLM(batch);
+        traceStep(trace, 'filter_done');
+        logTranscript('copilot', batch, filterResult);
+      }
+      trace.filterResult = nameDetected ? `BYPASS(${ASSISTANT_NAME})` : filterResult;
+
+      client.copilotContextWindow.push(batch);
+      while (client.copilotContextWindow.length > CONTEXT_WINDOW_SIZE) client.copilotContextWindow.shift();
+
+      if (filterResult === 'SKIP') {
+        client.copilotPipelineSize = Math.max(0, client.copilotPipelineSize - batchItemCount);
+        client.copilotFilteredCount += batchItemCount;
+        traceFinish(trace);
+        drainBuffer();
+        return;
+      }
+
+      let messageForOpus = batch;
+      if (client.copilotContextWindow.length > 1) {
+        const prevContext = client.copilotContextWindow.slice(0, -1);
+        messageForOpus = 'Recent conversation context:\n' +
+          prevContext.map(t => `- ${t}`).join('\n') +
+          '\n\nCurrent: ' + batch;
+      }
+
+      client.copilotInflight = true;
+      client.copilotPassedCount += batchItemCount;
+
+      const safetyTimer = setTimeout(() => {
+        if (client.copilotInflight) {
+          client.copilotPipelineSize = Math.max(0, client.copilotPipelineSize - batchItemCount);
+          client.copilotInflight = false;
+          traceStep(trace, 'safety_timeout');
+          traceFinish(trace);
+          openclawClient.cancelPendingRuns();
+          drainBuffer();
+        }
+      }, COPILOT_TIMEOUT_MS);
+
+      traceStep(trace, 'opus_start');
+      try {
+        const reply = await openclawClient.chat(messageForOpus, G1_COPILOT_PREFIX);
+        clearTimeout(safetyTimer);
+        traceStep(trace, 'opus_done');
+        client.copilotPipelineSize = Math.max(0, client.copilotPipelineSize - batchItemCount);
+        const t = reply ? reply.trim() : '';
+        const skip = !t || /^NO[_]?R?E?P?L?Y?$/i.test(t) || t.startsWith('NO_REPLY') || t.startsWith('NO_RE');
+        if (t && !skip) {
+          traceStep(trace, 'display');
+          sendToAppClient(client, { type: 'ai_response', text: t });
+        } else {
+          traceStep(trace, 'no_reply');
+        }
+      } catch (e: any) {
+        clearTimeout(safetyTimer);
+        traceStep(trace, 'opus_error');
+        client.copilotPipelineSize = Math.max(0, client.copilotPipelineSize - batchItemCount);
+      } finally {
+        client.copilotInflight = false;
+        traceFinish(trace);
+        drainBuffer();
+      }
+    };
+
+    const drainBuffer = () => {
+      if (client.copilotBuffer.length > 0 && client.copilotMode) {
+        if (client.copilotDebounceTimer) clearTimeout(client.copilotDebounceTimer);
+        client.copilotDebounceTimer = setTimeout(() => {
+          client.copilotDebounceTimer = null;
+          sendCopilotBatch();
+        }, 1_000);
+      }
+    };
+
+    // ─── Handle incoming messages from G1Claw app ───
+    ws.on('message', async (data) => {
+      try {
+        const msg = JSON.parse(String(data));
+
+        if (msg.type === 'ping') {
+          sendToAppClient(client, { type: 'pong' });
+          return;
+        }
+
+        if (msg.type === 'set_mode') {
+          client.copilotMode = !!msg.copilot;
+          if (client.copilotDebounceTimer) { clearTimeout(client.copilotDebounceTimer); client.copilotDebounceTimer = null; }
+          client.copilotBuffer = [];
+          client.copilotPipelineSize = 0;
+          client.copilotContextWindow.length = 0;
+          console.log(`[${clientId}] Copilot ${client.copilotMode ? 'ON' : 'OFF'} (via app)`);
+          sendToAppClient(client, { type: 'ai_response', text: client.copilotMode ? 'Copilot ON' : 'Copilot OFF' });
+          return;
+        }
+
+        if (msg.type === 'transcription' && msg.text) {
+          const userText = msg.text.trim();
+          if (!userText) return;
+
+          client.lastTranscriptAt = Date.now();
+          client.lastTranscriptText = userText;
+
+          const lower = userText.toLowerCase();
+
+          // Voice commands
+          if (lower.includes('neue session') || lower.includes('new session')) {
+            console.log(`[${clientId}] Session reset`);
+            sendToAppClient(client, { type: 'ai_response', text: 'New session...' });
+            try { await openclawClient.sendRaw('/new'); } catch (e) {}
+            sendToAppClient(client, { type: 'ai_response', text: 'Session reset.' });
+            return;
+          }
+
+          const normalized = lower.replace(/[-]/g, '').replace(/[.,!?]/g, '').trim();
+          const copilotPatterns = [
+            'copilot modus', 'copilot mode',
+            'copilot an', 'copilot aus',
+            'copilot on', 'copilot off',
+            'copilotmodus',
+          ];
+          if (copilotPatterns.some(p => normalized === p)) {
+            client.copilotMode = !client.copilotMode;
+            const state = client.copilotMode ? 'Copilot ON' : 'Copilot OFF';
+            console.log(`[${clientId}] ${state}`);
+            if (client.copilotDebounceTimer) { clearTimeout(client.copilotDebounceTimer); client.copilotDebounceTimer = null; }
+            client.copilotBuffer = [];
+            client.copilotPipelineSize = 0;
+            client.copilotContextWindow.length = 0;
+            sendToAppClient(client, { type: 'ai_response', text: state });
+            return;
+          }
+
+          // Copilot mode: debounce + filter
+          if (client.copilotMode) {
+            console.log(`[${clientId}] Copilot heard: "${userText}"`);
+            client.copilotBuffer.push(userText);
+            client.copilotPipelineSize++;
+            if (client.copilotDebounceTimer) clearTimeout(client.copilotDebounceTimer);
+            client.copilotDebounceTimer = setTimeout(() => {
+              client.copilotDebounceTimer = null;
+              sendCopilotBatch();
+            }, COPILOT_DEBOUNCE_MS);
+            return;
+          }
+
+          // Normal mode — send directly to OpenClaw
+          const normalTrace = createTrace('normal', userText);
+          logTranscript('normal', userText);
+          console.log(`[${clientId}] User: "${userText}"`);
+
+          traceStep(normalTrace, 'opus_start');
+          const reply = await openclawClient.chat(
+            userText, G1_PREFIX,
+            () => sendToAppClient(client, { type: 'ai_response', text: 'Moment...' })
+          );
+          traceStep(normalTrace, 'opus_done');
+
+          const trimmed = reply ? reply.trim() : '';
+          const isNoReply = !trimmed || /^NO[_]?R?E?P?L?Y?$/i.test(trimmed) || trimmed.startsWith('NO_REPLY') || trimmed.startsWith('NO_RE');
+          if (trimmed && !isNoReply) {
+            console.log(`[${clientId}] Hex: "${reply.substring(0, 80)}"`);
+            traceStep(normalTrace, 'display');
+            sendToAppClient(client, { type: 'ai_response', text: reply });
+          } else {
+            console.log(`[${clientId}] Hex: silent (NO_REPLY)`);
+            traceStep(normalTrace, 'no_reply');
+          }
+          traceFinish(normalTrace);
+          return;
+        }
+
+        if (msg.type === 'audio' && msg.data) {
+          // Future: server-side STT (Whisper) with base64 PCM audio
+          console.log(`[${clientId}] Audio chunk received (${msg.data.length} chars b64) — server-side STT not yet implemented`);
+          return;
+        }
+      } catch (e: any) {
+        console.error(`[${clientId}] Message error: ${e.message}`);
+      }
+    });
+
+    ws.on('close', () => {
+      console.log(`[${clientId}] G1Claw app disconnected`);
+      if (client.copilotDebounceTimer) clearTimeout(client.copilotDebounceTimer);
+      appClients.delete(clientId);
+    });
+
+    ws.on('error', (err) => {
+      console.error(`[${clientId}] WebSocket error: ${err.message}`);
+    });
+  });
+
+  server.listen(PUSH_PORT, PUSH_BIND, () => console.log(`[Push] API + WebSocket on http://${PUSH_BIND}:${PUSH_PORT}${PUSH_TOKEN ? ' (auth required)' : ''}`));
 }
 
 // ─── Bridge App ───
@@ -1335,9 +1675,9 @@ class G1OpenClawBridge extends AppServer {
 
 async function main() {
   console.log('G1-OpenClaw Bridge v0.9.0');
-  console.log(`  MentraOS: ${PACKAGE_NAME}`);
+  console.log(`  MentraOS: ${PACKAGE_NAME || 'DISABLED (no PACKAGE_NAME)'}`);
   console.log(`  OpenClaw: ${OPENCLAW_WS_URL}`);
-  console.log(`  Ports: ${PORT} (MentraOS), ${PUSH_PORT} (Push API)`);
+  console.log(`  Ports: ${PACKAGE_NAME ? `${PORT} (MentraOS), ` : ''}${PUSH_PORT} (Push API + App WebSocket)`);
   console.log(`  Transcripts: ${TRANSCRIPTS_DIR}`);
   console.log(`  Copilot filter: ${FILTER_LLM_URL ? `${FILTER_LLM_MODEL} @ ${FILTER_LLM_URL}` : 'DISABLED (no FILTER_LLM_URL)'}`);
   console.log(`  Assistant name: "${ASSISTANT_NAME}" (keyword bypass for copilot filter)`);
@@ -1349,8 +1689,14 @@ async function main() {
   catch (err: any) { console.error('OpenClaw connect failed:', err.message); }
 
   startPushServer();
-  const app = new G1OpenClawBridge();
-  await app.start();
+
+  // MentraOS bridge is optional — only start if PACKAGE_NAME is configured
+  if (PACKAGE_NAME && MENTRAOS_API_KEY) {
+    const app = new G1OpenClawBridge();
+    await app.start();
+  } else {
+    console.log('[MentraOS] Skipped — no PACKAGE_NAME/MENTRAOS_API_KEY. Using G1Claw app WebSocket only.');
+  }
 }
 
 main().catch(console.error);
