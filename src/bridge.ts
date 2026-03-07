@@ -223,7 +223,7 @@ export class G1OpenClawBridge extends AppServer {
         return;
       }
 
-      if (manualMode && (normalized === 'confirm' || normalized === 'bestätigen' || normalized === 'senden' || normalized === 'send')) {
+      if (manualMode && (normalized === 'confirm' || normalized === 'bestätigen' || normalized === 'senden' || normalized === 'send' || normalized === 'commit')) {
         if (manualBuffer.length === 0) {
           display.showStatus('Buffer empty', 2000);
           return;

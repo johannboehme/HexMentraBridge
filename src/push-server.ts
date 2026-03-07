@@ -429,7 +429,7 @@ export function startPushServer(
             return;
           }
 
-          if (client.manualMode && (normalized === 'confirm' || normalized === 'bestätigen' || normalized === 'senden' || normalized === 'send')) {
+          if (client.manualMode && (normalized === 'confirm' || normalized === 'bestätigen' || normalized === 'senden' || normalized === 'send' || normalized === 'commit')) {
             if (client.manualBuffer.length === 0) {
               sendToAppClient(client, { type: 'ai_response', text: 'Buffer empty' });
               return;
