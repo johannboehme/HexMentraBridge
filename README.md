@@ -131,9 +131,10 @@ Open the MentraOS app on your phone → start your app → the glasses should sh
 | *Any question or statement* | Sends to your AI, shows reply on display |
 | "Copilot mode" / "Copilot on/off" / "Copilot an/aus" | Toggle copilot mode |
 | "New session" / "Neue Session" | Reset the AI conversation |
-| "Manual mode" / "Manueller Modus" | Buffer transcripts until you say "confirm" / "send" |
+| "Manual mode" / "Manueller Modus" | Buffer transcripts until you say "confirm" / "send" / "submit" |
+| "Backspace" / "Zurück" | Remove the last entry from the manual buffer |
 | "Automatic mode" / "Auto mode" | Return to normal (auto-send) mode |
-| "Cancel" / "Stop" / "Abbrechen" / "Clear display" / "Clear buffer" | Clear the display and cancel pagination |
+| "Cancel" / "Stop" / "Abbrechen" / "Clear" / "Clear display" / "Clear buffer" | Clear the display, buffer, and cancel pagination |
 
 ### Head gestures
 

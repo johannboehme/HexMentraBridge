@@ -223,7 +223,7 @@ export class G1OpenClawBridge extends AppServer {
         return;
       }
 
-      if (manualMode && (normalized === 'confirm' || normalized === 'bestätigen' || normalized === 'senden' || normalized === 'send' || normalized === 'commit')) {
+      if (manualMode && (normalized === 'confirm' || normalized === 'bestätigen' || normalized === 'senden' || normalized === 'send' || normalized === 'commit' || normalized === 'submit')) {
         if (manualBuffer.length === 0) {
           display.showStatus('Buffer empty', 2000);
           return;
@@ -251,16 +251,29 @@ export class G1OpenClawBridge extends AppServer {
         traceFinish(normalTrace);
         return;
       }
-      if (manualMode && (normalized === 'clear' || normalized === 'löschen')) {
-        const count = manualBuffer.length;
-        manualBuffer = [];
-        console.log(`[${sessionId}] Manual buffer cleared (${count} items)`);
-        display.showStatus('Buffer cleared', 2000);
+      if (manualMode && (normalized === 'backspace' || normalized === 'zurück')) {
+        if (manualBuffer.length > 0) {
+          const removed = manualBuffer.pop();
+          console.log(`[${sessionId}] Manual buffer backspace, removed: "${removed}" (${manualBuffer.length} remaining)`);
+          if (manualBuffer.length > 0) {
+            const preview = manualBuffer.slice(-3).map((t, i) => `${manualBuffer.length - Math.min(3, manualBuffer.length) + i + 1}. ${t.substring(0, 50)}`).join('\n');
+            display.showNotification(`Buffer [${manualBuffer.length}]:\n${preview}`, 5000);
+          } else {
+            display.showStatus('Buffer empty', 2000);
+          }
+        } else {
+          display.showStatus('Buffer empty', 2000);
+        }
         return;
       }
 
-      const cancelPatterns = ['cancel', 'abbrechen', 'clear buffer', 'clear display', 'stop', 'stopp'];
+      const cancelPatterns = ['cancel', 'abbrechen', 'clear', 'clear buffer', 'clear display', 'stop', 'stopp', 'löschen'];
       if (cancelPatterns.some(p => normalized === p)) {
+        if (manualMode && manualBuffer.length > 0) {
+          const count = manualBuffer.length;
+          manualBuffer = [];
+          console.log(`[${sessionId}] Manual buffer cleared (${count} items)`);
+        }
         display.cancelAndClear();
         display.showStatus('Cleared.', 1500);
         console.log(`[${sessionId}] Display cleared by user`);

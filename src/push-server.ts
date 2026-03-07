@@ -429,7 +429,7 @@ export function startPushServer(
             return;
           }
 
-          if (client.manualMode && (normalized === 'confirm' || normalized === 'bestätigen' || normalized === 'senden' || normalized === 'send' || normalized === 'commit')) {
+          if (client.manualMode && (normalized === 'confirm' || normalized === 'bestätigen' || normalized === 'senden' || normalized === 'send' || normalized === 'commit' || normalized === 'submit')) {
             if (client.manualBuffer.length === 0) {
               sendToAppClient(client, { type: 'ai_response', text: 'Buffer empty' });
               return;
@@ -458,16 +458,29 @@ export function startPushServer(
             traceFinish(normalTrace);
             return;
           }
-          if (client.manualMode && (normalized === 'clear' || normalized === 'löschen')) {
-            const count = client.manualBuffer.length;
-            client.manualBuffer = [];
-            console.log(`[${clientId}] Manual buffer cleared (${count} items)`);
-            sendToAppClient(client, { type: 'ai_response', text: 'Buffer cleared' });
+          if (client.manualMode && (normalized === 'backspace' || normalized === 'zurück')) {
+            if (client.manualBuffer.length > 0) {
+              const removed = client.manualBuffer.pop();
+              console.log(`[${clientId}] Manual buffer backspace, removed: "${removed}" (${client.manualBuffer.length} remaining)`);
+              if (client.manualBuffer.length > 0) {
+                const preview = client.manualBuffer.slice(-3).map((t, i) => `${client.manualBuffer.length - Math.min(3, client.manualBuffer.length) + i + 1}. ${t.substring(0, 50)}`).join('\n');
+                sendToAppClient(client, { type: 'ai_response', text: `Buffer [${client.manualBuffer.length}]:\n${preview}` });
+              } else {
+                sendToAppClient(client, { type: 'ai_response', text: 'Buffer empty' });
+              }
+            } else {
+              sendToAppClient(client, { type: 'ai_response', text: 'Buffer empty' });
+            }
             return;
           }
 
-          const cancelPatterns = ['cancel', 'abbrechen', 'clear buffer', 'clear display', 'stop', 'stopp'];
+          const cancelPatterns = ['cancel', 'abbrechen', 'clear', 'clear buffer', 'clear display', 'stop', 'stopp', 'löschen'];
           if (cancelPatterns.some(p => normalized === p)) {
+            if (client.manualMode && client.manualBuffer.length > 0) {
+              const count = client.manualBuffer.length;
+              client.manualBuffer = [];
+              console.log(`[${clientId}] Manual buffer cleared (${count} items)`);
+            }
             console.log(`[${clientId}] Display cleared by user`);
             sendToAppClient(client, { type: 'ai_response', text: 'Cleared.' });
             return;
