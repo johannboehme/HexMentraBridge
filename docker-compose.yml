@@ -1,0 +1,22 @@
+services:
+  hexmentra-bridge:
+    image: oven/bun:1
+    network_mode: host
+    working_dir: /app
+    environment:
+      OPENCLAW_WS_URL: ws://localhost:18789
+      OPENCLAW_GW_TOKEN: ${OPENCLAW_GW_TOKEN}
+      PORT: "${PORT:-19995}"
+      PUSH_PORT: "${PUSH_PORT:-19996}"
+      PUSH_BIND: "${PUSH_BIND:-0.0.0.0}"
+      PUSH_TOKEN: ${PUSH_TOKEN:-}
+      PACKAGE_NAME: ${PACKAGE_NAME:-}
+      MENTRAOS_API_KEY: ${MENTRAOS_API_KEY:-}
+      NOTIF_BLOCKLIST: ${NOTIF_BLOCKLIST:-}
+      FILTER_LLM_URL: ${FILTER_LLM_URL:-}
+      FILTER_LLM_API_KEY: ${FILTER_LLM_API_KEY:-}
+      FILTER_LLM_MODEL: ${FILTER_LLM_MODEL:-}
+    volumes:
+      - .:/app
+    restart: unless-stopped
+    entrypoint: ["sh", "-c", "bun install && bun run start"]
