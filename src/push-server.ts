@@ -458,6 +458,17 @@ export function startPushServer(
             traceFinish(normalTrace);
             return;
           }
+          if (client.manualMode && (normalized === 'preview' || normalized === 'vorschau')) {
+            if (client.manualBuffer.length === 0) {
+              sendToAppClient(client, { type: 'ai_response', text: 'Buffer empty' });
+              return;
+            }
+            const lines = client.manualBuffer.map((t, i) => `${i + 1}. ${t}`);
+            const previewText = `Buffer [${client.manualBuffer.length}]:\n${lines.join('\n')}`;
+            console.log(`[${clientId}] Manual preview (${client.manualBuffer.length} items)`);
+            sendToAppClient(client, { type: 'ai_response', text: previewText });
+            return;
+          }
           if (client.manualMode && (normalized === 'backspace' || normalized === 'zurück')) {
             if (client.manualBuffer.length > 0) {
               const removed = client.manualBuffer.pop();

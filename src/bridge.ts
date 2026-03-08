@@ -251,6 +251,17 @@ export class G1OpenClawBridge extends AppServer {
         traceFinish(normalTrace);
         return;
       }
+      if (manualMode && (normalized === 'preview' || normalized === 'vorschau')) {
+        if (manualBuffer.length === 0) {
+          display.showStatus('Buffer empty', 2000);
+          return;
+        }
+        const lines = manualBuffer.map((t, i) => `${i + 1}. ${t}`);
+        const previewText = `Buffer [${manualBuffer.length}]:\n${lines.join('\n')}`;
+        console.log(`[${sessionId}] Manual preview (${manualBuffer.length} items)`);
+        display.showReply(previewText);
+        return;
+      }
       if (manualMode && (normalized === 'backspace' || normalized === 'zurück')) {
         if (manualBuffer.length > 0) {
           const removed = manualBuffer.pop();
