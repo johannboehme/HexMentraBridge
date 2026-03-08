@@ -59,12 +59,12 @@ function signPayload(payload: string, privKeyPkcs8Base64: string): string {
 
 function buildPayload(params: {
   deviceId: string, clientId: string, clientMode: string,
-  role: string, scopes: string[], signedAtMs: number, token: string
+  role: string, scopes: string[], signedAtMs: number, token: string, nonce?: string
 }): string {
-  const version = 'v1';
+  const version = 'v2';
   const scopes = params.scopes.join(',');
   const token = params.token ?? '';
-  return [version, params.deviceId, params.clientId, params.clientMode, params.role, scopes, String(params.signedAtMs), token].join('|');
+  return [version, params.deviceId, params.clientId, params.clientMode, params.role, scopes, String(params.signedAtMs), token, params.nonce ?? ''].join('|');
 }
 
 // Connect and attempt to pair
@@ -77,7 +77,7 @@ const ws = new WebSocket(GW_URL);
 let idCounter = 0;
 const nextId = () => `setup-${++idCounter}`;
 
-ws.on('open', () => {
+function sendConnect(nonce?: string) {
   const signedAt = Date.now();
   const payload = buildPayload({
     deviceId: keyData.deviceId,
@@ -87,6 +87,7 @@ ws.on('open', () => {
     scopes: SCOPES,
     signedAtMs: signedAt,
     token: GW_TOKEN,
+    nonce: nonce || '',
   });
   const signature = signPayload(payload, keyData.privateKeyPkcs8Base64);
 
@@ -104,44 +105,70 @@ ws.on('open', () => {
         publicKey: keyData.publicKeyBase64url,
         signature,
         signedAt,
+        ...(nonce ? { nonce } : {}),
       },
     },
   }));
+  return connId;
+}
 
-  ws.on('message', (raw: Buffer) => {
-    const msg = JSON.parse(String(raw));
-    if (msg.type === 'res' && msg.id === connId) {
-      if (msg.ok) {
-        const deviceToken = msg.payload?.auth?.deviceToken;
-        console.log('Connected successfully!');
-        if (deviceToken) {
-          keyData.deviceToken = deviceToken;
-          keyData.scopes = msg.payload?.auth?.scopes;
-          fs.writeFileSync(AUTH_PATH, JSON.stringify(keyData, null, 2));
-          console.log('Device token saved:', deviceToken);
-          console.log('Scopes:', keyData.scopes);
-          ws.close();
-          process.exit(0);
-        } else {
-          console.log('Connected but no device token in response (may need pairing approval)');
-          console.log('Response:', JSON.stringify(msg.payload, null, 2));
-          ws.close();
-          process.exit(0);
-        }
-      } else {
-        const err = msg.error?.message || JSON.stringify(msg.error);
-        if (err.includes('NOT_PAIRED') || err.includes('device identity required') || err.includes('pending')) {
-          console.log('Device needs pairing approval. Run: openclaw devices approve');
-          console.log('Device ID:', keyData.deviceId);
-          console.log('Then re-run this script.');
-        } else {
-          console.error('Connect failed:', err);
-        }
-        ws.close();
-        process.exit(1);
+let connId: string;
+
+ws.on('open', () => {
+  // Wait for connect.challenge from gateway; fall back to no-nonce after 2s
+  const challengeTimeout = setTimeout(() => {
+    console.log('No challenge received, connecting without nonce...');
+    connId = sendConnect();
+  }, 2000);
+
+  const challengeHandler = (data: Buffer) => {
+    try {
+      const msg = JSON.parse(String(data));
+      if (msg.type === 'event' && msg.event === 'connect.challenge' && msg.payload?.nonce) {
+        clearTimeout(challengeTimeout);
+        ws.removeListener('message', challengeHandler);
+        console.log('Received challenge nonce, connecting...');
+        connId = sendConnect(msg.payload.nonce);
       }
+    } catch {}
+  };
+  ws.on('message', challengeHandler);
+});
+
+ws.on('message', (raw: Buffer) => {
+  const msg = JSON.parse(String(raw));
+
+  if (msg.type === 'res' && msg.id === connId) {
+    if (msg.ok) {
+      const deviceToken = msg.payload?.auth?.deviceToken;
+      console.log('Connected successfully!');
+      if (deviceToken) {
+        keyData.deviceToken = deviceToken;
+        keyData.scopes = msg.payload?.auth?.scopes;
+        fs.writeFileSync(AUTH_PATH, JSON.stringify(keyData, null, 2));
+        console.log('Device token saved:', deviceToken);
+        console.log('Scopes:', keyData.scopes);
+        ws.close();
+        process.exit(0);
+      } else {
+        console.log('Connected but no device token in response (may need pairing approval)');
+        console.log('Response:', JSON.stringify(msg.payload, null, 2));
+        ws.close();
+        process.exit(0);
+      }
+    } else {
+      const err = msg.error?.message || JSON.stringify(msg.error);
+      if (err.includes('NOT_PAIRED') || err.includes('device identity required') || err.includes('pending')) {
+        console.log('Device needs pairing approval. Run: openclaw devices approve');
+        console.log('Device ID:', keyData.deviceId);
+        console.log('Then re-run this script.');
+      } else {
+        console.error('Connect failed:', err);
+      }
+      ws.close();
+      process.exit(1);
     }
-  });
+  }
 });
 
 ws.on('error', (err: Error) => {
