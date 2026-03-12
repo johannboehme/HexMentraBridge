@@ -131,6 +131,11 @@ Open the MentraOS app on your phone → start your app → the glasses should sh
 | *Any question or statement* | Sends to your AI, shows reply on display |
 | "Copilot mode" / "Copilot on/off" / "Copilot an/aus" | Toggle copilot mode |
 | "New session" / "Neue Session" | Reset the AI conversation |
+| "Manual mode" / "Manueller Modus" | Buffer transcripts until you say "confirm" / "send" / "submit" |
+| "Preview" / "Vorschau" | Show the full manual buffer (paginated) before sending |
+| "Backspace" / "Zurück" | Remove the last entry from the manual buffer |
+| "Automatic mode" / "Auto mode" | Return to normal (auto-send) mode |
+| "Cancel" / "Stop" / "Abbrechen" / "Clear" / "Clear display" / "Clear buffer" | Clear the display, buffer, and cancel pagination |
 
 ### Head gestures
 
@@ -313,8 +318,8 @@ bun scripts/push-bitmap.js "Hello World" 10000
 The G1 has a monochrome (green-on-black) display, roughly 640×200 pixels with ~576px usable width. Keep in mind:
 
 - **No color, no grayscale** — 1-bit only
-- **~5 lines of text** visible at once (~180 characters max per page)
-- **No scrolling** — the bridge auto-paginates long replies (180 chars/page, 8s per page)
+- **~4 lines of ~40 characters** visible at once
+- **No scrolling** — the bridge word-wraps and auto-paginates long replies (4 lines/page, 8s per page). Say "cancel" or "stop" to dismiss.
 - **No images** in replies — text only (but you can push bitmaps via the API)
 - AI replies should be **2-3 short sentences max**, no markdown, no emojis
 
@@ -427,7 +432,7 @@ When you see the normal mode prefix, reply with **plain text only**:
 - Max 2-3 short sentences
 - No markdown (`**`, `#`, `-`, backticks)
 - No emojis
-- Keep it under ~180 characters (longer replies get auto-paginated)
+- Keep it under ~160 characters (longer replies get word-wrapped and auto-paginated)
 
 Your reply routes back automatically through the Gateway WebSocket → Bridge → glasses display.
 
@@ -463,7 +468,7 @@ Use push for calendar reminders, urgent notifications, weather alerts, or anythi
 ### Tips for agents
 
 - The display is tiny and monochrome — brevity is everything
-- Long replies auto-paginate (180 chars/page, 8s per page) but shorter is always better
+- Long replies word-wrap and auto-paginate (~4 lines/page, 8s per page) but shorter is always better
 - Push API has no auth by default (localhost-only) — if `PUSH_TOKEN` is set, include it as a Bearer token
 - The bridge auto-reconnects to your Gateway WebSocket if it drops
 - Transcription works in multiple languages even though the subscription is `en-US`
@@ -471,6 +476,12 @@ Use push for calendar reminders, urgent notifications, weather alerts, or anythi
 - In copilot mode, you get conversation context with each RELEVANT transcript — use it!
 
 ## Changelog
+
+### v0.11.0
+- **Modular refactor** — Split monolithic `src/index.ts` into separate modules (`bridge`, `config`, `display`, `filter`, `openclaw`, `push-server`, etc.) for maintainability.
+- **Display word-wrapping** — Text now wraps at ~40 chars/line and paginates at 4 lines/page, matching the G1's actual display dimensions. Previously text could run off screen.
+- **Cancel/clear voice commands** — Say "cancel", "stop", "stopp", "abbrechen", "clear buffer", or "clear display" to immediately dismiss the current display and cancel pagination.
+- **Docker Compose** — Added `docker-compose.yml` for containerized deployment.
 
 ### v0.10.0
 - **G1Claw App WebSocket** — New `/app-ws` WebSocket endpoint on port 3001 for direct communication with the [G1Claw](https://github.com/johannboehme/g1app) Android app. Receives transcriptions, sends AI responses back. Full copilot mode support (same filter/debounce pipeline as MentraOS sessions).
